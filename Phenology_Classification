@@ -1,0 +1,417 @@
+// Display AOI
+Map.centerObject(geometry, 10);
+
+// -----------------------------------
+//general functions
+// -----------------------------------
+var clip= function (image){
+  return image.clip(geometry);
+};
+
+// -----------------------------------
+//cloud mask for HLS
+// -----------------------------------
+  var cloudMask_HLS = function(image) {
+  var qa = image.select('Fmask');
+  var cloud = qa.bitwiseAnd(1 << 4)              
+                .or(qa.bitwiseAnd(1 << 5))
+                .or(qa.bitwiseAnd(1 << 3))
+                .or(qa.bitwiseAnd(1 << 1))  
+                ;   
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image
+      .updateMask(cloud.not()).updateMask(mask2)
+};
+
+//------------------------------------
+// Hansen Water mask
+//------------------------------------
+var hansenImage = ee.Image('UMD/hansen/global_forest_change_2015').select('datamask');
+var maskWater = hansenImage.eq(1);
+
+var hansenWaterMask = function(image) {
+  image = image.updateMask(maskWater);
+  return image;
+};
+
+//------------------------------------
+// Forest mask
+//------------------------------------
+// Load NLCD Land Cover for a specific year (e.g., 2019)
+var nlcd = ee.Image('USGS/NLCD_RELEASES/2019_REL/NLCD/2019')
+  .select('landcover')
+  .clip(geometry);
+
+// Define forest class values based on NLCD legend
+var forestClasses = [41, 42, 43]; // 41: Deciduous, 42: Evergreen, 43: Mixed Forest
+
+// Create a forest mask
+var forestMask = nlcd.remap(forestClasses, [1, 1, 1], 0); // 1 = forest, 0 = non-forest
+
+
+// -----------------------------------
+// phenology threshould
+// -----------------------------------
+var aoi = geometry
+var year = 2021;
+var start = ee.Date.fromYMD(year, 1, 1);
+var end = ee.Date.fromYMD(year, 12, 31);
+var threshold = 0.30;  // EVI threshold for phenology
+
+// -----------------------------------
+// EVI
+// -----------------------------------
+function addEVI(image) {
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B5'),   // NIR
+      'RED': image.select('B4'),   // Red
+      'BLUE': image.select('B3')   // Blue
+    }).rename('EVI');
+  return image.addBands(evi).select(['EVI']).copyProperties(image, ['system:time_start']);
+}
+
+// -----------------------------------
+//change S2-band names
+// -----------------------------------
+var changeNames = function(img){
+  return img.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],['B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+}
+
+// -----------------------------------
+// Load and Merge HLSL30 + HLSS30
+// -----------------------------------
+var hlsl = ee.ImageCollection('NASA/HLS/HLSL30/v002')
+  .filterBounds(geometry)                // <<< Spatial filter here
+  .filterDate(start, end)
+  .map(clip)
+  .map(cloudMask_HLS)
+  .map(hansenWaterMask)
+  .map(addEVI)
+  .select("EVI")
+  .map(function(image) {
+    return image.updateMask(forestMask);
+  })
+  .map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+    return img.set('DOY', doy);
+  });
+
+var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
+  .filterBounds(geometry)                // <<< Spatial filter here
+  .filterDate(start, end)
+  .map(clip)
+  .map(cloudMask_HLS)
+  .map(hansenWaterMask)
+  .map(changeNames)
+  .map(addEVI)
+  .select("EVI")
+  .map(function(image) {
+    return image.updateMask(forestMask);
+  })
+  .map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+    return img.set('DOY', doy);
+  });
+
+// Merge and sort
+var hls = hlsl.merge(hlss).sort('system:time_start');
+
+//Map.addLayer(hls)
+
+// Print number of images
+// print('Number of images:', hls.size());
+
+// -------------------------------
+// Percentiles
+// -------------------------------
+var EVI_p90 = hls.reduce(ee.Reducer.percentile([90]))
+var EVI_p10 = hls.reduce(ee.Reducer.percentile([10]))
+
+//Map.addLayer(EVI_p10, {}, 'EVIp10')
+//Map.addLayer(EVI_p90, {}, 'EVIp90')
+
+// -------------------------------
+// Fit Harmonic Model    What does this do?
+// -------------------------------
+var omega = 2 * Math.PI / 365.25;
+
+function addTimeBands(image) {
+  var t = ee.Date(image.get('system:time_start')).difference(start, 'day');
+  var time = ee.Image.constant(t).float().rename('t');
+  var sin = time.multiply(omega).sin().rename('sin');
+  var cos = time.multiply(omega).cos().rename('cos');
+  return image.addBands([time, sin, cos]);
+}
+
+var harmonicInputs = hls.map(addTimeBands);
+
+var harmonicFit = harmonicInputs.select(['t', 'sin', 'cos', 'EVI'])
+  .reduce(ee.Reducer.linearRegression({
+    numX: 3,
+    numY: 1
+  }));
+
+var coeffs = harmonicFit.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([['a', 'b', 'c']]);
+
+//print('Harmonic Coefficients:', coeffs);
+
+// -------------------------------
+//Predict EVI Using Harmonic Model
+// -------------------------------
+function predictEVI(day) {
+  var t = ee.Image.constant(day).float();
+  var sin = t.multiply(omega).sin();
+  var cos = t.multiply(omega).cos();
+
+  var pred = coeffs.select('a')
+    .add(coeffs.select('b').multiply(sin))
+    .add(coeffs.select('c').multiply(cos))
+    .rename('EVI');
+
+  return pred.set('system:time_start', start.advance(day, 'day').millis());
+}
+
+var days = ee.List.sequence(0, 364, 8);  // every 8 days
+var fittedEVI_HM = ee.ImageCollection.fromImages(days.map(predictEVI))
+.map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1); // 1-based DOY
+    return img.set('DOY', doy);
+  });
+
+//Map.addLayer(fittedEVI_HM)
+
+// Add time as a band for each image
+var fittedWithTime = fittedEVI_HM.map(function(img) {
+  var t = ee.Date(img.get('system:time_start')).difference(start, 'day');
+  var timeBand = ee.Image.constant(t).float().rename('time');
+  return img.addBands(timeBand);
+});
+
+
+// Mask where EVI is below threshold
+var aboveThreshold = fittedWithTime.map(function(img) {
+  return img.updateMask(img.select('EVI').gt(threshold));
+});
+
+// SOS: earliest date EVI > threshold
+var sos = aboveThreshold.select('time').min();
+
+// EOS: latest date EVI > threshold
+var eos = aboveThreshold.select('time').max();
+
+// POS: date of max EVI
+var pos = fittedWithTime.qualityMosaic('EVI').select('time');
+
+// Peak EVI value
+var peakEVI = fittedWithTime.qualityMosaic('EVI').select('EVI');
+
+// Length of Season
+var los = eos.subtract(sos).rename('LOS');
+
+
+// Add SOS to map with dynamic scaling
+// Map.addLayer(sos, {
+//   min: 100,
+//   max: 200,
+//   palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
+// }, 'Start of Season (DOY)');
+
+// Map.addLayer(sos, {}, 'SOS')
+// Map.addLayer(eos, {}, 'EOS')
+// Map.addLayer(los, {}, 'LOS')
+
+
+
+// ---------------------------------------------
+// Supervised classification
+// ---------------------------------------------
+
+var points = newdata
+
+// Get a list of unique species
+var speciesList = points.aggregate_array('Species').distinct();
+print('Unique species:', speciesList);
+
+// Create a dictionary mapping species to integers
+var speciesDict = ee.Dictionary.fromLists(speciesList, ee.List.sequence(0, speciesList.length().subtract(1)));
+print('Species dictionary (string → int):', speciesDict);
+
+var speciesPointsLabeled = points.map(function(feature) {
+  var speciesStr = feature.get('species');
+  var speciesInt = speciesDict.get(speciesStr);
+  return feature.set('species_id', speciesInt); // <- integer label column
+});
+
+
+var seasonMetrics = sos.rename('SOS')
+  // .addBands(eos.rename('EOS'))
+  // .addBands(pos.rename('POS'))
+  // .addBands(peakEVI.rename('PeakEVI'))
+  // .addBands(los); 
+  
+// Add EVI metrics too
+// Compute mean EVI
+var meanEVI = fittedWithTime.select('EVI').mean().rename('EVI_mean');
+
+// Compute standard deviation of EVI
+var stdEVI = fittedWithTime.select('EVI').reduce(ee.Reducer.stdDev()).rename('EVI_stdDev');
+
+// Compute range (max - min)
+var maxEVI = fittedWithTime.select('EVI').max();
+var minEVI = fittedWithTime.select('EVI').min();
+var rangeEVI = maxEVI.subtract(minEVI).rename('EVI_range');
+
+seasonMetrics = seasonMetrics
+  .addBands(meanEVI)
+  .addBands(stdEVI)
+  .addBands(rangeEVI);
+  
+//Map.addLayer (seasonMetrics)
+
+// Assume `trainingPoints` is a FeatureCollection with a property 'class' (or change to your column name)
+var trainingPoints = newdata 
+
+// Create unique numeric variable for each species
+
+// 2.1. Get the unique species names
+var speciesList = trainingPoints.aggregate_array('Species').distinct();
+
+// 2.2. Create a lookup dictionary: e.g., {'BASS': 0, 'FIR': 1, 'OAK': 2, ...}
+var speciesDict = ee.Dictionary.fromLists(
+  speciesList,                 // keys
+  ee.List.sequence(0, speciesList.length().subtract(1)) // values
+);
+
+// 2.3. Map over trainingPoints to add a numeric 'class' property
+var trainingPointsLabeled = trainingPoints.map(function(feature) {
+  var species = feature.get('Species');
+  var classNum = speciesDict.get(species);
+  return feature.set('class', classNum);
+});
+
+
+var training = seasonMetrics.sampleRegions({
+  collection: trainingPointsLabeled,
+  properties: ['class'],
+  scale: 30
+});
+
+// Step 2: Randomly split data (70% training, 30% testing)
+var withRandom = training.randomColumn('random');
+var split = 0.7;
+var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
+var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+// Step 3: Train classifier on the training set
+var classifier = ee.Classifier.smileRandomForest(10).train({
+  features: trainingSet,
+  classProperty: 'class',
+  inputProperties: seasonMetrics.bandNames()
+});
+
+// Step 4: Classify the test set
+var validated = testSet.classify(classifier);
+
+// Step 5: Generate confusion matrix
+var confMatrix = validated.errorMatrix('class', 'classification');
+print('Confusion Matrix:', confMatrix);
+print('Overall Accuracy:', confMatrix.accuracy());
+print('Kappa Coefficient:', confMatrix.kappa());
+print('Consumer Accuracy (Recall):', confMatrix.consumersAccuracy());
+print('Producer Accuracy (Precision):', confMatrix.producersAccuracy());
+
+var classified = seasonMetrics.classify(classifier);
+
+//Step 6: Display the results
+Map.addLayer(classified, {
+  min: 0,
+  max: 8,  // Set this to match your number of classes (0 to 13 = 14 total)
+  palette: [
+  'e41a1c', // red
+  '377eb8', // blue
+  '4daf4a', // green
+  '984ea3', // purple
+  'ff7f00', // orange
+  'ffff33', // yellow
+  'a65628', // brown
+  'f781bf', // pink
+  '999999'  // gray
+]
+}, 'Supervised Classification');
+
+// Add a legend to the map
+// set position of panel
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+ 
+// Create legend title
+var legendTitle = ui.Label({
+  value: 'Tree Species Classification',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+    }
+});
+ 
+// Add the title to the panel
+legend.add(legendTitle);
+ 
+// Creates and styles 1 row of the legend.
+var makeRow = function(color, name) {
+ 
+      // Create the label that is actually the colored box.
+      var colorBox = ui.Label({
+        style: {
+          backgroundColor: '#' + color,
+          // Use padding to give the box height and width.
+          padding: '8px',
+          margin: '0 0 4px 0'
+        }
+      });
+ 
+      // Create the label filled with the description text.
+      var description = ui.Label({
+        value: name,
+        style: {margin: '0 0 4px 6px'}
+      });
+ 
+      // return the panel
+      return ui.Panel({
+        widgets: [colorBox, description],
+        layout: ui.Panel.Layout.Flow('horizontal')
+      });
+};
+ 
+//  Palette with the colors
+var palette = [
+ 'e41a1c', // red
+  '377eb8', // blue
+  '4daf4a', // green
+  '984ea3', // purple
+  'ff7f00', // orange
+  'ffff33', // yellow
+  'a65628', // brown
+  'f781bf', // pink
+  '999999'  // gray
+]; 
+// name of the legend
+// speciesList is an ee.List from trainingPoints.aggregate_array('Species').distinct()
+
+speciesList.evaluate(function(names) {
+  // Build the legend rows
+  for (var i = 0; i < names.length; i++) {
+    legend.add(makeRow(palette[i], names[i]));
+  }
+}); 
+ 
+// add legend to map (alternatively you can also print the legend to the console)
+Map.add(legend);
