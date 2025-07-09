@@ -1,0 +1,462 @@
+// Display AOI
+Map.centerObject(geometry, 11);
+
+// -----------------------------------
+//general functions
+// -----------------------------------
+var clip= function (image){
+  return image.clip(geometry);
+};
+
+// -----------------------------------
+//cloud mask for HLS
+// -----------------------------------
+  var cloudMask_HLS = function(image) {
+  var qa = image.select('Fmask');
+  var cloud = qa.bitwiseAnd(1 << 4)              
+                .or(qa.bitwiseAnd(1 << 5))
+                .or(qa.bitwiseAnd(1 << 3))
+                .or(qa.bitwiseAnd(1 << 1))  
+                ;   
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image
+      .updateMask(cloud.not()).updateMask(mask2)
+};
+
+//------------------------------------
+// Hansen Water mask
+//------------------------------------
+var hansenImage = ee.Image('UMD/hansen/global_forest_change_2015').select('datamask');
+var maskWater = hansenImage.eq(1);
+
+var hansenWaterMask = function(image) {
+  image = image.updateMask(maskWater);
+  return image;
+};
+
+//------------------------------------
+// Forest mask
+//------------------------------------
+// Load NLCD Land Cover for a specific year (e.g., 2019)
+var nlcd = ee.Image('USGS/NLCD_RELEASES/2019_REL/NLCD/2019')
+  .select('landcover')
+  .clip(geometry);
+
+// Define forest class values based on NLCD legend
+var forestClasses = [41, 42, 43]; // 41: Deciduous, 42: Evergreen, 43: Mixed Forest
+
+// Create a forest mask
+var forestMask = nlcd.remap(forestClasses, [1, 1, 1], 0); // 1 = forest, 0 = non-forest
+
+
+// -----------------------------------
+// phenology threshold
+// -----------------------------------
+var aoi = geometry
+var year = 2021;
+var start = ee.Date.fromYMD(year, 1, 1);
+var end = ee.Date.fromYMD(year, 12, 31);
+var threshold = 0.30;  // EVI threshold for phenology
+
+// -----------------------------------
+// EVI
+// -----------------------------------
+function addEVI(image) {
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B5'),   // NIR
+      'RED': image.select('B4'),   // Red
+      'BLUE': image.select('B3')   // Blue
+    }).rename('EVI');
+  return image.addBands(evi).copyProperties(image, ['system:time_start']);
+}
+
+// -----------------------------------
+//change S2-band names
+// -----------------------------------
+var changeNames = function(img){
+  return img.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],['B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+}
+
+// -----------------------------------
+// Load and Merge HLSL30 + HLSS30
+// -----------------------------------
+var hlsl = ee.ImageCollection('NASA/HLS/HLSL30/v002')
+  .filterBounds(geometry)                // <<< Spatial filter here
+  .filterDate(start, end)
+  .map(clip)
+  .map(cloudMask_HLS)
+  .map(hansenWaterMask)
+  .map(addEVI)
+  //.select("EVI")
+  .map(function(image) {
+    return image.updateMask(forestMask);
+  })
+  .map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+    return img.set('DOY', doy);
+  });
+
+var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
+  .filterBounds(geometry)                // <<< Spatial filter here
+  .filterDate(start, end)
+  .map(clip)
+  .map(cloudMask_HLS)
+  .map(hansenWaterMask)
+  .map(changeNames)
+  .map(addEVI)
+  //.select("EVI")
+  .map(function(image) {
+    return image.updateMask(forestMask);
+  })
+  .map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+    return img.set('DOY', doy);
+  });
+
+// Merge and sort
+var hls = hlsl.merge(hlss).sort('system:time_start');
+
+print("n Images", hls.size())
+
+print("HLS Bands", hls.first().bandNames())
+
+// -------------------------------
+// Percentiles
+// -------------------------------
+var EVI_p90 = hls.reduce(ee.Reducer.percentile([90]))
+var EVI_p10 = hls.reduce(ee.Reducer.percentile([10]))
+
+//Map.addLayer(EVI_p10, {}, 'EVIp10')
+//Map.addLayer(EVI_p90, {}, 'EVIp90')
+
+// -------------------------------
+// Fit Harmonic Model    What does this do?
+// -------------------------------
+var omega = 2 * Math.PI / 365.25;
+
+function addTimeBands(image) {
+  var t = ee.Date(image.get('system:time_start')).difference(start, 'day');
+  var time = ee.Image.constant(t).float().rename('t');
+  var sin = time.multiply(omega).sin().rename('sin');
+  var cos = time.multiply(omega).cos().rename('cos');
+  return image.addBands([time, sin, cos]);
+}
+
+var harmonicInputs = hls.map(addTimeBands);
+
+var harmonicFit = harmonicInputs.select(['t', 'sin', 'cos', 'EVI'])
+  .reduce(ee.Reducer.linearRegression({
+    numX: 3,
+    numY: 1
+  }));
+
+var coeffs = harmonicFit.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([['a', 'b', 'c']]);
+
+//print('Harmonic Coefficients:', coeffs);
+
+// -------------------------------
+//Predict EVI Using Harmonic Model
+// -------------------------------
+function predictEVI(day) {
+  var t = ee.Image.constant(day).float();
+  var sin = t.multiply(omega).sin();
+  var cos = t.multiply(omega).cos();
+
+  var pred = coeffs.select('a')
+    .add(coeffs.select('b').multiply(sin))
+    .add(coeffs.select('c').multiply(cos))
+    .rename('EVI');
+
+  return pred.set('system:time_start', start.advance(day, 'day').millis());
+}
+
+var days = ee.List.sequence(0, 364, 8);  // every 8 days
+var fittedEVI_HM = ee.ImageCollection.fromImages(days.map(predictEVI))
+.map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1); // 1-based DOY
+    return img.set('DOY', doy);
+  });
+
+//Map.addLayer(fittedEVI_HM)
+
+// Add time as a band for each image
+var fittedWithTime = fittedEVI_HM.map(function(img) {
+  var t = ee.Date(img.get('system:time_start')).difference(start, 'day');
+  var timeBand = ee.Image.constant(t).float().rename('time');
+  return img.addBands(timeBand);
+});
+
+
+// Mask where EVI is below threshold
+var aboveThreshold = fittedWithTime.map(function(img) {
+  return img.updateMask(img.select('EVI').gt(threshold));
+});
+
+// SOS: earliest date EVI > threshold
+var sos = aboveThreshold.select('time').min();
+
+// EOS: latest date EVI > threshold
+var eos = aboveThreshold.select('time').max();
+
+// POS: date of max EVI
+var pos = fittedWithTime.qualityMosaic('EVI').select('time');
+
+// Peak EVI value
+var peakEVI = fittedWithTime.qualityMosaic('EVI').select('EVI');
+
+// Length of Season
+var los = eos.subtract(sos).rename('LOS');
+
+
+// Add SOS to map with dynamic scaling
+// Map.addLayer(sos, {
+//   min: 100,
+//   max: 200,
+//   palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
+// }, 'Start of Season (DOY)');
+
+// Map.addLayer(sos, {}, 'SOS')
+// Map.addLayer(eos, {}, 'EOS')
+// Map.addLayer(los, {}, 'LOS')
+
+// ---------------------------------------------
+// Bands in Classification
+//----------------------------------------------
+var seasonMetrics = sos.rename('SOS')
+  //.addBands(eos.rename('EOS'))
+  //.addBands(pos.rename('POS'))
+  //.addBands(peakEVI.rename('PeakEVI'))
+  //.addBands(los); 
+  
+// Add EVI metrics too
+// Compute mean EVI
+var meanEVI = fittedWithTime.select('EVI').mean().rename('EVI_mean');
+
+// Compute standard deviation of EVI
+var stdEVI = fittedWithTime.select('EVI').reduce(ee.Reducer.stdDev()).rename('EVI_stdDev');
+
+// Compute range (max - min)
+var maxEVI = fittedWithTime.select('EVI').max();
+var minEVI = fittedWithTime.select('EVI').min();
+var rangeEVI = maxEVI.subtract(minEVI).rename('EVI_range');
+
+seasonMetrics = seasonMetrics
+  .addBands(meanEVI)
+  .addBands(stdEVI)
+  .addBands(rangeEVI);
+  
+// Define the bands you want to compute range for
+var bands = ['B2', 'B3', 'B5'];
+
+// Function to calculate mean, stdDev, and range for a single band
+var summarizeBand = function(band) {
+  var selected = hls.select(band);
+  var mean = selected.mean().rename(band + '_mean');
+  var stdDev = selected.reduce(ee.Reducer.stdDev()).rename(band + '_stdDev');
+  var range = selected.max().subtract(selected.min()).rename(band + '_range');
+  return ee.Image.cat([mean, stdDev, range]);
+};
+
+// Apply function to all bands and combine into one image
+var summaryBands = ee.Image.cat(
+  bands.map(summarizeBand)
+);
+
+// Add the summary stats to your existing seasonMetrics image
+seasonMetrics = seasonMetrics.addBands(summaryBands);
+  
+print('Bands:', seasonMetrics.bandNames());
+
+// ---------------------------------------------
+// Supervised classification
+// ---------------------------------------------
+
+var points = newdata
+
+
+// Add a random value column (between 0 and 1)
+var withRandom = points.randomColumn('random');
+
+// Define training and testing sets
+var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
+var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
+
+print(trainingPoints.first());
+
+// Load your imagery
+var image = seasonMetrics; // already defined
+
+// Sample the image at training points
+var training = image.sampleRegions({
+  collection: trainingPoints,
+  properties: ["Oak"],//["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech" ], // just oak for now
+  scale: 30
+});
+
+print('First 10 training samples:', training.limit(10));
+
+var rf = ee.Classifier.smileRandomForest(50)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: training,
+    classProperty: 'Oak',              // Response variable
+    inputProperties: seasonMetrics.bandNames() // Predictors (e.g., 'EVI')
+  });
+  
+  // Apply the trained model to the entire image
+var predictedOak = seasonMetrics.classify(rf).rename('Oak_pred');
+
+Map.addLayer(predictedOak, {min: 0, max: 1, palette: ['white', 'green']}, 'Predicted Oak Proportion');
+
+// Get variable importance
+var importance = ee.Dictionary(rf.explain().get('importance'));
+print('Variable importance (Oak model):', importance);
+
+// Sample testing data from the image
+var testing = seasonMetrics.sampleRegions({
+  collection: testingPoints,
+  properties: ['Oak'],
+  scale: 30
+});
+
+// Predict Oak proportion for testing set
+var predicted = testing.classify(rf);
+
+// Add squared error as a new property
+var withError = predicted.map(function(f) {
+  var observed = ee.Number(f.get('Oak'));
+  var predicted = ee.Number(f.get('classification'));
+  var squaredError = observed.subtract(predicted).pow(2);
+  return f.set('squaredError', squaredError);
+});
+
+// Compute MSE (mean of squared errors)
+var mse = withError.aggregate_mean('squaredError');
+print('Mean Squared Error (MSE):', mse);
+
+
+// ---------------------------------------------
+// Add Legend
+// ---------------------------------------------
+
+// Define the palette and range
+var palette = ['white', 'green'];
+var minVal = 0;
+var maxVal = 1;
+
+// Create the color bar image (horizontal gradient)
+var colorBar = ee.Image.pixelLonLat()
+  .select('longitude')
+  .multiply((maxVal - minVal) / 100.0)
+  .add(minVal);
+
+// Create a thumbnail for the color bar
+var colorBarVis = {
+  min: minVal,
+  max: maxVal,
+  palette: palette
+};
+
+var colorBarThumb = ui.Thumbnail({
+  image: colorBar,
+  params: colorBarVis,
+  style: {
+    stretch: 'horizontal',
+    width: '150px',
+    height: '15px',
+    margin: '0 8px',
+    maxHeight: '20px'
+  }
+});
+
+// Add min/max labels
+var legendLabels = ui.Panel([
+  ui.Label(minVal.toString(), {margin: '4px 8px'}),
+  ui.Label(maxVal.toString(), {
+    margin: '4px 8px',
+    textAlign: 'right',
+    stretch: 'horizontal'
+  })
+], ui.Panel.Layout.flow('horizontal'));
+
+// Legend title
+var legendTitle = ui.Label('Oak Proportion', {
+  fontWeight: 'bold',
+  fontSize: '14px',
+  margin: '0 0 4px 0'
+});
+
+// Combine all into a single panel
+var legend = ui.Panel({
+  widgets: [legendTitle, colorBarThumb, legendLabels],
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px',
+    backgroundColor: 'white'
+  }
+});
+
+// Add to the map
+Map.add(legend);
+
+// Loop through all the species
+
+// Define your species list
+var speciesList = ["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech"];
+
+// Define color palette for all (optional: adjust if needed)
+var palette = ['white', 'green'];
+var minVal = 0;
+var maxVal = 1;
+
+// Loop through species and generate predictions
+speciesList.forEach(function(species) {
+  
+  // Sample training points for this species
+  var training = seasonMetrics.sampleRegions({
+    collection: trainingPoints,
+    properties: [species],
+    scale: 30
+  });
+
+  // Train Random Forest regression model
+  var rf = ee.Classifier.smileRandomForest(50)
+    .setOutputMode('REGRESSION')
+    .train({
+      features: training,
+      classProperty: species,
+      inputProperties: seasonMetrics.bandNames()
+    });
+
+  // Predict species proportion
+  var prediction = seasonMetrics.classify(rf).rename(species + '_pred');
+
+  // Add prediction map to viewer
+  Map.addLayer(prediction, {min: 0, max: 1, palette: palette}, 'Predicted ' + species);
+
+  // Variable importance
+  var importance = ee.Dictionary(rf.explain().get('importance'));
+  print('Variable importance: ' + species, importance);
+
+  // MSE on testing data
+  var testing = seasonMetrics.sampleRegions({
+    collection: testingPoints,
+    properties: [species],
+    scale: 30
+  });
+
+  var predictedTest = testing.classify(rf);
+  var withError = predictedTest.map(function(f) {
+    var observed = ee.Number(f.get(species));
+    var pred = ee.Number(f.get('classification'));
+    var squaredError = observed.subtract(pred).pow(2);
+    return f.set('squaredError', squaredError);
+  });
+
+  var mse = withError.aggregate_mean('squaredError');
+  print('MSE for ' + species + ':', mse);
+});
+
