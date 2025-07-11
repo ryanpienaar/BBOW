@@ -1,0 +1,374 @@
+---
+title: "APIS Canopy Calculation"
+author: "Ryan Pienaar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(stringr)
+library(sjPlot)
+library(sf)
+library(tidyverse)
+
+```
+
+# Pauli lab ground sampling
+
+```{r}
+# Load your CSV
+df <- read.csv("Trees_Sites.csv")  # Replace with your actual file path
+canopy <- read_csv("CanopyHeightMonica.csv")
+
+```
+
+Correct species names
+```{r}
+
+head(df)
+unique(df$Species)
+
+
+df <- df %>%
+  mutate(Species= recode(Species,
+                          "Aspen sp." = "Aspen",
+                         "BTA" = "Aspen",
+                         "ASPEN SP." = "Aspen",
+                          "Maple sp." = "Maple",
+                         "Maple SP." = "Maple",
+                         "red maple" = "Maple",
+                         "RMN" = "Maple",
+                         "RNM" = "Maple",
+                         "REM" = "Maple",
+                         "RM" = "Maple",
+                          "SM" = "Maple",
+                         "SRM" = "Maple",
+                         "sugar maple"= "Maple",
+                         "MAPLE SP." = "Maple",
+                         "maple? "  = "Maple",
+                          "QA" = "Aspen",
+                         "aspen"  = "Aspen",
+                          "BAL " = "Balsam",
+                         "VAL " = "Balsam",
+                         "VAL" = "Balsam",
+                         "balsam" = "Balsam",
+                         "BALSM" = "Balsam",
+                         "BIRCH SP." = "Birch",
+                         "YB." = "Birch",
+                         "YB" = "Birch",
+                         "yellow birch" = "Birch",
+                         "PB" = "Birch",
+                         "paper birch" = "Birch",
+                         "BAL" = "Balsam",
+                         "C "= "Cedar",
+                         "C"= "Cedar",
+                         "cedar"= "Cedar",
+                         "H" ="Hemlock",
+                         "H " = "Hemlock",
+                         "WP" = "Pine",
+                         "white pine?" = "Pine",
+                         "IW" = "Ironwood",
+                         "BASS" = "Basswood",
+                         "WO?" = "Oak",
+                         "WO" = "Oak",
+                         "RO" = "Oak",
+                         "O" = "Oak",
+                         "BS" = "Spruce",
+                         "SPRUCE SP." = "Spruce",
+                         "RP" = "Pine",
+                         "T" = "Tamarack",
+                         "beech? Picture" = "Beech",
+                         "BA" = "Ash",
+                         "BA " = "Ash",
+                         "BL" = "Black locust",
+                         "ELM" = "Elm",
+                         "UNKNWN" = "Unknown",
+                         "UNKWN" = "Unknown",
+                         "UNKNWN, APPLE?" = "Unknown"))
+                                      
+```
+
+
+```{r}
+# Convert Height and DBH to numeric (in case they're read as characters)
+df <- df %>%
+  mutate(
+    Height = as.numeric(Height),
+    DBH = as.numeric(DBH)
+  )
+
+df <- df %>%
+  filter(tolower(Vigor) != "snag")
+
+df <- df %>%
+  mutate(Site = str_replace(Site, "^Oak", "OAK"),
+         Site = str_replace(Site, "^Sand", "SAND"))
+
+# Filter to only trees within 1 SD of max height (likely canopy trees)
+# canopy_trees <- df %>%
+#   group_by(Site) %>%
+#   mutate(
+#     max_height = max(Height, na.rm = TRUE),
+#     sd_height = sd(Height, na.rm = TRUE)
+#   ) %>%
+#   filter(Height >= (max_height - sd_height)) %>%
+#   ungroup()
+
+
+head(df)
+head(canopy)
+colnames(canopy)[3] <- "Site"
+
+df <- df |>  left_join(canopy %>% select(Site, b1), by = "Site") %>%
+  rename(CanopyHeight = b1)  # Rename b1 to Height
+
+canopy_trees <- df |> filter(Height >= CanopyHeight)
+
+```
+
+
+
+```{r}
+# Compute canopy area proxy
+canopy_trees <- canopy_trees %>%
+  mutate(canopy_area = (DBH^2))  
+
+# Summarize by species at each site
+species_canopy <- canopy_trees %>%
+  group_by(Site, Species) %>%
+  summarise(species_area = sum(canopy_area, na.rm = TRUE), .groups = "drop")
+
+# Total canopy area per site
+total_canopy <- species_canopy %>%
+  group_by(Site) %>%
+  summarise(total_area = sum(species_area), .groups = "drop")
+
+
+#Add site coords back
+site_coords <- df %>%
+  select(Site, Lat, Long) %>%
+  distinct()
+
+canopy_proportion <- species_canopy %>%
+  left_join(total_canopy, by = "Site") %>%
+  mutate(proportion = species_area / total_area) %>%
+  left_join(site_coords, by = "Site")  # <-- this keeps the lat/long
+
+
+### Dominant species stands
+stands <- filter(canopy_proportion, proportion >= 0.5)
+write.csv(stands, "Stands.csv")
+
+```
+
+
+I want to determine the DBH cut off at which the tree is likely to be in the canopy
+
+```{r}
+
+ggplot(data= df, aes(x= DBH, y =Height, colour = Species))+
+  geom_point()
+
+
+# Fit the mixed-effects model
+mod <- glm(Height ~ DBH * Species, data = df)
+
+# Inspect the model
+tab_model(mod)
+
+# Define canopy height threshold
+cutoff <- mean(canopy_trees$Height, na.rm = TRUE) + sd(canopy_trees$Height, na.rm = TRUE)
+
+
+
+```
+
+
+
+#NPS Ground Sampling
+
+Load NPS data
+```{r}
+
+NPS <- read_csv("Y:/rpienaar/Apostle Islands/InputData/APIS_Veg_2021.csv")
+NPSCanopy <- read.csv("CanopyHeightNPS.csv")
+
+colnames(NPSCanopy)[2] <- "Plot"
+
+NPS <- NPS |> left_join(NPSCanopy |> select(Plot, b1), by = "Plot") |>
+   rename(CanopyHeight = b1)
+
+NPS <- NPS |> mutate(genus= stringr::word(Accepted_LatinName, 1))
+
+genus_common <- tibble(
+  genus = c("Acer", "Abies", "Betula", "Thuja", "Tsuga",
+            "Quercus", "Fraxinus", "Populus", "Ostrya", "Picea", "Tilia", "Ulmus",
+            "Prunus", "Sorbus", "Pinus", "unknown"),
+  common_name = c("Maple", "Balsam", "Birch", "Cedar", "Hemlock",
+                  "Oak", "Ash", "Aspen", "Ironwood", "Spruce", "Basswood", "Elm",
+                  "Unknown", "Unknown", "Pine", "Unknown")
+)
+
+
+
+NPS <- NPS %>%
+  left_join(genus_common, by = "genus")
+
+
+NPS <- NPS |> select(Accepted_LatinName, Diameter_cm, Status, CanopyHeight, Plot, genus, common_name, Northing, Easting )
+
+```
+Calculate heigth based on model from Monica
+
+```{r}
+
+#rename columns to match input data
+colnames(NPS)[2] <- "DBH"
+colnames(NPS)[7] <- "Species"
+
+NPS$DBH <- as.numeric(NPS$DBH)
+NPS$Species <- as.factor(NPS$Species)
+
+NPS$Height <- predict(mod, newdata = NPS)
+
+
+```
+
+
+```{r}
+
+NPS$Plot <- as.factor(NPS$Plot)
+NPS <- NPS |> filter(Status == "Live")
+
+NPScc <- NPS |> filter(Height >= CanopyHeight)
+
+NPScc$canopy <- NPScc$DBH^2
+
+# Summarize by species at each site
+NPSspecies_canopy <- NPScc %>%
+  group_by(Plot, Species) %>%
+  summarise(species_area = sum(canopy, na.rm = TRUE), .groups = "drop")
+
+# Total canopy area per site
+NPStotal_canopy <- NPSspecies_canopy %>%
+  group_by(Plot) %>%
+  summarise(total_area = sum(species_area), .groups = "drop")
+
+#Add site coords back
+NPSsite_coords <- NPS %>%
+  select(Plot, Northing, Easting) %>%
+  distinct()
+
+NPScanopy_proportion <- NPSspecies_canopy %>%
+  left_join(NPStotal_canopy, by = "Plot") %>%
+  mutate(proportion = species_area / total_area) %>%
+  left_join(NPSsite_coords, by = "Plot")  # <-- this keeps the lat/long
+
+NPScanopy_proportion$Northing <- as.numeric(NPScanopy_proportion$Northing)
+```
+
+
+
+
+
+Add common name
+
+```{r}
+
+NPScanopy_proportion |> filter(proportion > 0.5)
+
+NPScanopy_proportion |> filter(Species == "Oak")
+
+
+```
+
+
+Now I have the 2 files of the 2 sources with the proportions of canopy cover, I should put them together to make one file
+
+```{r}
+
+
+
+head(canopy_proportion)
+
+head(NPScanopy_proportion)
+
+crs_utm <- 32615  
+# Convert UTM to lat long
+dfutmsf <- st_as_sf(NPScanopy_proportion, coords = c("Northing", "Easting"), crs = crs_utm)
+
+dflatlong <- st_transform(dfutmsf, crs = 4326)
+
+# Extract lat/long into columns
+NPSprop <- dflatlong %>%
+  mutate(Lat = st_coordinates(.)[,2],
+          Long = st_coordinates(.)[,1]) %>%
+  st_drop_geometry()
+
+
+# Combine dfs
+head(canopy_proportion)
+
+head(NPSprop)
+
+#rename cols
+colnames(NPSprop)[1] <- "Site"
+Combo <- rbind(canopy_proportion, NPSprop)
+
+```
+
+
+```{r}
+
+ComboDom <- Combo |> filter(proportion >= 0.5) 
+
+Combo <- Combo |> group_by(Site, total_area, Lat, Long, Species) %>%
+  summarise(prop_area = sum(species_area) / unique(total_area), .groups = "drop") %>%
+  pivot_wider(
+    names_from = Species,
+    values_from = prop_area)
+    
+Combo[is.na(Combo)] <- 0
+
+head(Combo)
+
+
+write.csv(ComboDom, "MandNPSdata.csv")
+write.csv(Combo, "SpeciesProps.csv")
+
+```
+
+Summary of data I have
+
+```{r}
+library(gt)
+
+Combo |> pivot_longer(cols = Aspen:Beech, names_to = "Species", values_to = "Cover") %>%
+  mutate(
+    Category = case_when(
+      Cover == 1 ~ "Pure stands",
+      Cover > 0 & Cover < 1 ~ "Mixed stands",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(Category != "Other") %>%
+  count(Species, Category) %>%
+  pivot_wider(names_from = Category, values_from = n, values_fill = 0) |>
+  gt()
+
+```
+
+
+Finish
+
+```{r}
+
+
+```
+
