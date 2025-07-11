@@ -289,140 +289,29 @@ print(trainingPoints.first());
 // Load your imagery
 var image = seasonMetrics; // already defined
 
-// Sample the image at training points
-var training = image.sampleRegions({
-  collection: trainingPoints,
-  properties: ["Oak"],//["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech" ], // just oak for now
-  scale: 30
-});
-
-print('First 10 training samples:', training.limit(10));
-
-var rf = ee.Classifier.smileRandomForest(50)
-  .setOutputMode('REGRESSION')
-  .train({
-    features: training,
-    classProperty: 'Oak',              // Response variable
-    inputProperties: seasonMetrics.bandNames() // Predictors (e.g., 'EVI')
-  });
-  
-  // Apply the trained model to the entire image
-var predictedOak = seasonMetrics.classify(rf).rename('Oak_pred');
-
-Map.addLayer(predictedOak, {min: 0, max: 1, palette: ['white', 'green']}, 'Predicted Oak Proportion');
-
-// Get variable importance
-var importance = ee.Dictionary(rf.explain().get('importance'));
-print('Variable importance (Oak model):', importance);
-
-// Sample testing data from the image
-var testing = seasonMetrics.sampleRegions({
-  collection: testingPoints,
-  properties: ['Oak'],
-  scale: 30
-});
-
-// Predict Oak proportion for testing set
-var predicted = testing.classify(rf);
-
-// Add squared error as a new property
-var withError = predicted.map(function(f) {
-  var observed = ee.Number(f.get('Oak'));
-  var predicted = ee.Number(f.get('classification'));
-  var squaredError = observed.subtract(predicted).pow(2);
-  return f.set('squaredError', squaredError);
-});
-
-// Compute MSE (mean of squared errors)
-var mse = withError.aggregate_mean('squaredError');
-print('Mean Squared Error (MSE):', mse);
-
 
 // ---------------------------------------------
-// Add Legend
+// Dominance Map
 // ---------------------------------------------
-
-// Define the palette and range
-var palette = ['white', 'green'];
-var minVal = 0;
-var maxVal = 1;
-
-// Create the color bar image (horizontal gradient)
-var colorBar = ee.Image.pixelLonLat()
-  .select('longitude')
-  .multiply((maxVal - minVal) / 100.0)
-  .add(minVal);
-
-// Create a thumbnail for the color bar
-var colorBarVis = {
-  min: minVal,
-  max: maxVal,
-  palette: palette
-};
-
-var colorBarThumb = ui.Thumbnail({
-  image: colorBar,
-  params: colorBarVis,
-  style: {
-    stretch: 'horizontal',
-    width: '150px',
-    height: '15px',
-    margin: '0 8px',
-    maxHeight: '20px'
-  }
-});
-
-// Add min/max labels
-var legendLabels = ui.Panel([
-  ui.Label(minVal.toString(), {margin: '4px 8px'}),
-  ui.Label(maxVal.toString(), {
-    margin: '4px 8px',
-    textAlign: 'right',
-    stretch: 'horizontal'
-  })
-], ui.Panel.Layout.flow('horizontal'));
-
-// Legend title
-var legendTitle = ui.Label('Oak Proportion', {
-  fontWeight: 'bold',
-  fontSize: '14px',
-  margin: '0 0 4px 0'
-});
-
-// Combine all into a single panel
-var legend = ui.Panel({
-  widgets: [legendTitle, colorBarThumb, legendLabels],
-  style: {
-    position: 'bottom-left',
-    padding: '8px 15px',
-    backgroundColor: 'white'
-  }
-});
-
-// Add to the map
-Map.add(legend);
-
-// Loop through all the species
-
 // Define your species list
 var speciesList = ["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech"];
 
-// Define color palette for all (optional: adjust if needed)
+// Define color palette
 var palette = ['white', 'green'];
-var minVal = 0;
-var maxVal = 1;
 
-// Loop through species and generate predictions
+// Create an empty object to store predictions
+var predictionLayers = {};  // This is a plain JS object
+
 speciesList.forEach(function(species) {
-  
-  // Sample training points for this species
+
+  // Sample training points
   var training = seasonMetrics.sampleRegions({
     collection: trainingPoints,
     properties: [species],
     scale: 30
   });
 
-  // Train Random Forest regression model
+  // Train RF model
   var rf = ee.Classifier.smileRandomForest(50)
     .setOutputMode('REGRESSION')
     .train({
@@ -431,17 +320,20 @@ speciesList.forEach(function(species) {
       inputProperties: seasonMetrics.bandNames()
     });
 
-  // Predict species proportion
+  // Predict
   var prediction = seasonMetrics.classify(rf).rename(species + '_pred');
 
-  // Add prediction map to viewer
+  // Save prediction layer as object entry
+  predictionLayers[species] = prediction;
+
+  // Visualize
   Map.addLayer(prediction, {min: 0, max: 1, palette: palette}, 'Predicted ' + species);
 
   // Variable importance
   var importance = ee.Dictionary(rf.explain().get('importance'));
   print('Variable importance: ' + species, importance);
 
-  // MSE on testing data
+  // Evaluate on testing data
   var testing = seasonMetrics.sampleRegions({
     collection: testingPoints,
     properties: [species],
@@ -460,3 +352,58 @@ speciesList.forEach(function(species) {
   print('MSE for ' + species + ':', mse);
 });
 
+// Now you can access, for example, the Aspen prediction with:
+print('Aspen prediction layer:', predictionLayers['Aspen']);
+
+// Stack predictions into a multi-band image
+var predictionImage = ee.Image.cat(speciesList.map(function(species) {
+  return predictionLayers[species];
+}));
+
+// Get max value index per pixel
+var maxIndex = predictionImage.toArray().arrayArgmax().arrayGet([0]).rename('dominant_index');
+
+// Optional: visualize with a color palette (assign each species a color)
+var palette = ['e6194b','3cb44b','ffe119','0082c8','f58231','911eb4','46f0f0','f032e6','d2f53c','fabebe','008080','e6beff'];
+
+Map.addLayer(maxIndex, {min: 0, max: speciesList.length - 1, palette: palette}, 'Dominant Species (Index)');
+
+// === Legend ===
+var speciesList = ["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech"];
+var palette = ['e6194b','3cb44b','ffe119','0082c8','f58231','911eb4','46f0f0','f032e6','d2f53c','fabebe','008080','e6beff'];
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+legend.add(ui.Label({
+  value: 'Dominant Species Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '0 0 8px 0',
+    padding: '0'
+  }
+}));
+
+for (var i = 0; i < speciesList.length; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: palette[i],
+      padding: '8px',
+      margin: '0 8px 4px 0'
+    }
+  });
+
+  var label = ui.Label({
+    value: speciesList[i],
+    style: {margin: '0 0 4px 0'}
+  });
+
+  legend.add(ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal')));
+}
+
+Map.add(legend);
