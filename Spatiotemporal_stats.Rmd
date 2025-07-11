@@ -1,0 +1,113 @@
+---
+title: "Spatiotemporal Stats"
+author: "Ryan Pienaar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load libraries
+```{r, include=FALSE}
+
+library(tidyverse)
+
+```
+Load data
+
+```{r}
+
+st_df <-  read.csv("EVI_Values_Per_Point.csv")
+
+```
+
+Clean data
+
+```{r}
+
+head(st_df)
+
+st_df <- st_df |> select(B2, B3, B4, B5, B6, B7, EVI, NDVI, Site, Species)
+str(st_df)
+
+st_df$Site <- as.factor(st_df$Site)
+st_df$Species <- as.factor(st_df$Species)
+
+```
+
+Lets create these Boxplots
+
+```{r}
+
+##################################
+# All Bands
+##################################
+
+# Step 1: Reshape to long format
+df_long <- st_df %>%
+  pivot_longer(cols = c(B2:B7, EVI, NDVI), names_to = "Band", values_to = "Value")
+
+# Step 2: Compute stats per Site × Species × Band
+evi_stats_df <- df_long %>%
+  group_by(Site, Species, Band) %>%
+  summarize(
+    mean = mean(Value, na.rm = TRUE),
+    sd = sd(Value, na.rm = TRUE),
+    Q1 = quantile(Value, 0.25, na.rm = TRUE),
+    Q3 = quantile(Value, 0.75, na.rm = TRUE),
+    range = max(Value, na.rm = TRUE) - min(Value, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Step 3: Pivot stats into long format
+evi_stats_long <- evi_stats_df %>%
+  pivot_longer(cols = c(mean, sd, Q1, Q3, range),
+               names_to = "Statistic",
+               values_to = "StatValue")
+
+# Step 4: Loop through each band and plot
+bands <- unique(evi_stats_long$Band)
+
+for (b in bands) {
+  data_band <- evi_stats_long %>%
+    filter(Band == b)
+  
+  y_limits <- data_band %>%
+    group_by(Statistic, Species) %>%
+    summarize(
+      Q1 = quantile(StatValue, 0.25, na.rm = TRUE),
+      Q3 = quantile(StatValue, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      lower = Q1 - 1.5 * (Q3 - Q1),
+      upper = Q3 + 1.5 * (Q3 - Q1)
+    )
+  
+  y_min <- min(y_limits$lower, na.rm = TRUE)
+  y_max <- max(y_limits$upper, na.rm = TRUE)
+
+  p <- data_band %>%
+    ggplot(aes(x = Statistic, y = StatValue, fill = Species)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6,
+                 position = position_dodge(width = 0.7)) +
+    coord_cartesian(ylim = c(y_min, y_max)) +
+    theme_minimal() +
+    labs(title = paste("EVI Stats by Species for", b),
+         x = "Statistic",
+         y = "Value") +
+    scale_fill_brewer(palette = "Set2") +
+    theme(axis.text.x = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5),
+          legend.title = element_blank())
+  
+  print(p)
+}
+
+```
+
+
+
+
