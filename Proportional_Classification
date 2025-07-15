@@ -407,3 +407,4 @@ for (var i = 0; i < speciesList.length; i++) {
 }
 
 Map.add(legend);
+
