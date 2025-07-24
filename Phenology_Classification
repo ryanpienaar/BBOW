@@ -304,10 +304,24 @@ print('Bands:', seasonMetrics.bandNames());
 //Map.addLayer (seasonMetrics)
 
 
-var trainingPoints = newdata; 
+// ---------------------------------------------
+// Supervised classification
+// ---------------------------------------------
 
-var trainingPoints = trainingPoints.filter(ee.Filter.neq('Species', null));
-print(trainingPoints)
+var points = newdata
+
+
+// Add a random value column (between 0 and 1)
+var withRandom = points.randomColumn('random');
+
+// Define training and testing sets
+var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
+var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
+
+print(trainingPoints.first());
+
+// Load your imagery
+var image = seasonMetrics; // already defined
 
 Map.addLayer( trainingPoints, {}, "Points")
 // Create unique numeric variable for each species
@@ -327,7 +341,7 @@ print(speciesDict)
 
 var trainingPointsLabeled = trainingPoints.map(function(feature) {
   var species = feature.get('Species');
-  var classNum = ee.Number(speciesDict.get(species)); // get index and cast to ee.Number
+  var classNum = (speciesDict.get(species)); // get index and cast to ee.Number
   return feature.set('class', classNum);
 });
 
@@ -467,4 +481,3 @@ speciesList.evaluate(function(names) {
  
 // add legend to map (alternatively you can also print the legend to the console)
 Map.add(legend);
-
