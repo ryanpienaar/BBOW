@@ -2,6 +2,18 @@
 Map.centerObject(geometry, 10);
 
 // -----------------------------------
+//Plot NPS points
+// -----------------------------------
+
+// Assuming your FeatureCollection is named `points`
+var filteredPoints = newdata.filter(ee.Filter.stringStartsWith('Site', '1'));
+
+// Check the results
+print('Filtered points:', filteredPoints);
+Map.addLayer(filteredPoints, {}, 'Sites starting with 1');
+
+
+// -----------------------------------
 //general functions
 // -----------------------------------
 var clip= function (image){
@@ -68,7 +80,7 @@ function addEVI(image) {
       'RED': image.select('B4'),   // Red
       'BLUE': image.select('B3')   // Blue
     }).rename('EVI');
-  return image.addBands(evi).select(['EVI']).copyProperties(image, ['system:time_start']);
+  return image.addBands(evi).copyProperties(image, ['system:time_start']);
 }
 
 // -----------------------------------
@@ -88,7 +100,7 @@ var hlsl = ee.ImageCollection('NASA/HLS/HLSL30/v002')
   .map(cloudMask_HLS)
   .map(hansenWaterMask)
   .map(addEVI)
-  .select("EVI")
+  //.select("EVI")
   .map(function(image) {
     return image.updateMask(forestMask);
   })
@@ -105,7 +117,7 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
   .map(hansenWaterMask)
   .map(changeNames)
   .map(addEVI)
-  .select("EVI")
+  //.select("EVI")
   .map(function(image) {
     return image.updateMask(forestMask);
   })
@@ -117,10 +129,13 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
 // Merge and sort
 var hls = hlsl.merge(hlss).sort('system:time_start');
 
-//Map.addLayer(hls)
+// var hls = hlss.sort('system:time_start');
 
-// Print number of images
-// print('Number of images:', hls.size());
+print("n Images", hls.size())
+
+print("HLS Bands", hls.first().bandNames())
+
+
 
 // -------------------------------
 // Percentiles
@@ -128,8 +143,7 @@ var hls = hlsl.merge(hlss).sort('system:time_start');
 var EVI_p90 = hls.reduce(ee.Reducer.percentile([90]))
 var EVI_p10 = hls.reduce(ee.Reducer.percentile([10]))
 
-//Map.addLayer(EVI_p10, {}, 'EVIp10')
-//Map.addLayer(EVI_p90, {}, 'EVIp90')
+
 
 // -------------------------------
 // Fit Harmonic Model    What does this do?
@@ -229,28 +243,16 @@ var los = eos.subtract(sos).rename('LOS');
 // Supervised classification
 // ---------------------------------------------
 
-var points = newdata
+// ---------------------------------------------
+// Bands in Classification
+//----------------------------------------------
 
-// Get a list of unique species
-var speciesList = points.aggregate_array('Species').distinct();
-print('Unique species:', speciesList);
-
-// Create a dictionary mapping species to integers
-var speciesDict = ee.Dictionary.fromLists(speciesList, ee.List.sequence(0, speciesList.length().subtract(1)));
-print('Species dictionary (string → int):', speciesDict);
-
-var speciesPointsLabeled = points.map(function(feature) {
-  var speciesStr = feature.get('species');
-  var speciesInt = speciesDict.get(speciesStr);
-  return feature.set('species_id', speciesInt); // <- integer label column
-});
-
-
+var seasonMetrics = peakEVI.rename('PeakEvi')
 var seasonMetrics = sos.rename('SOS')
-  // .addBands(eos.rename('EOS'))
-  // .addBands(pos.rename('POS'))
-  // .addBands(peakEVI.rename('PeakEVI'))
-  // .addBands(los); 
+  .addBands(eos.rename('EOS'))
+  .addBands(pos.rename('POS'))
+  .addBands(peakEVI.rename('PeakEVI'))
+  .addBands(los); 
   
 // Add EVI metrics too
 // Compute mean EVI
@@ -269,15 +271,51 @@ seasonMetrics = seasonMetrics
   .addBands(stdEVI)
   .addBands(rangeEVI);
   
+  
+// // Add B bands 
+
+// Define the bands you want to compute range for
+var bands = ['B2', 'B3', 'B5'];
+
+// Function to calculate mean, stdDev, and range for a single band
+var summarizeBand = function(band) {
+  var selected = hls.select(band);
+  var mean = selected.mean().rename(band + '_mean');
+  var stdDev = selected.reduce(ee.Reducer.stdDev()).rename(band + '_stdDev');
+  var range = selected.max().subtract(selected.min()).rename(band + '_range');
+  return ee.Image.cat([mean, stdDev, range]);
+};
+
+// Apply function to all bands and combine into one image
+var summaryBands = ee.Image.cat(
+  bands.map(summarizeBand)
+);
+
+// Add the summary stats to your existing seasonMetrics image
+seasonMetrics = seasonMetrics.addBands(summaryBands);
+
+
+
+seasonMetrics = seasonMetrics.select(['B2_mean', 'B3_mean','B5_mean','EVI_mean', "PeakEVI"])
+
+print('Bands:', seasonMetrics.bandNames());
+
+
 //Map.addLayer (seasonMetrics)
 
-// Assume `trainingPoints` is a FeatureCollection with a property 'class' (or change to your column name)
-var trainingPoints = newdata 
 
+var trainingPoints = newdata; 
+
+var trainingPoints = trainingPoints.filter(ee.Filter.neq('Species', null));
+print(trainingPoints)
+
+Map.addLayer( trainingPoints, {}, "Points")
 // Create unique numeric variable for each species
 
 // 2.1. Get the unique species names
 var speciesList = trainingPoints.aggregate_array('Species').distinct();
+
+print(speciesList)
 
 // 2.2. Create a lookup dictionary: e.g., {'BASS': 0, 'FIR': 1, 'OAK': 2, ...}
 var speciesDict = ee.Dictionary.fromLists(
@@ -285,12 +323,16 @@ var speciesDict = ee.Dictionary.fromLists(
   ee.List.sequence(0, speciesList.length().subtract(1)) // values
 );
 
-// 2.3. Map over trainingPoints to add a numeric 'class' property
+print(speciesDict)
+
 var trainingPointsLabeled = trainingPoints.map(function(feature) {
   var species = feature.get('Species');
-  var classNum = speciesDict.get(species);
+  var classNum = ee.Number(speciesDict.get(species)); // get index and cast to ee.Number
   return feature.set('class', classNum);
 });
+
+print("Training Points Labeled",trainingPointsLabeled)
+
 
 
 var training = seasonMetrics.sampleRegions({
@@ -299,6 +341,17 @@ var training = seasonMetrics.sampleRegions({
   scale: 30
 });
 
+print('First sampled feature:', training.first());
+
+Export.table.toDrive({
+  collection: training,
+  description: 'training_export_with_bands',
+  fileFormat: 'CSV',
+  selectors: training.first().propertyNames()  // exports all properties
+});
+
+print(training)
+
 // Step 2: Randomly split data (70% training, 30% testing)
 var withRandom = training.randomColumn('random');
 var split = 0.7;
@@ -306,11 +359,16 @@ var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
 var testSet = withRandom.filter(ee.Filter.gte('random', split));
 
 // Step 3: Train classifier on the training set
-var classifier = ee.Classifier.smileRandomForest(10).train({
+var classifier = ee.Classifier.smileRandomForest(50).train({
   features: trainingSet,
   classProperty: 'class',
   inputProperties: seasonMetrics.bandNames()
 });
+
+
+
+// Print variable importance
+print('Variable importance:', classifier.explain());
 
 // Step 4: Classify the test set
 var validated = testSet.classify(classifier);
@@ -328,7 +386,7 @@ var classified = seasonMetrics.classify(classifier);
 //Step 6: Display the results
 Map.addLayer(classified, {
   min: 0,
-  max: 8,  // Set this to match your number of classes (0 to 13 = 14 total)
+  max: 5,  // Set this to match your number of classes (0 to 13 = 14 total)
   palette: [
   'e41a1c', // red
   '377eb8', // blue
@@ -336,9 +394,6 @@ Map.addLayer(classified, {
   '984ea3', // purple
   'ff7f00', // orange
   'ffff33', // yellow
-  'a65628', // brown
-  'f781bf', // pink
-  '999999'  // gray
 ]
 }, 'Supervised Classification');
 
@@ -399,9 +454,6 @@ var palette = [
   '984ea3', // purple
   'ff7f00', // orange
   'ffff33', // yellow
-  'a65628', // brown
-  'f781bf', // pink
-  '999999'  // gray
 ]; 
 // name of the legend
 // speciesList is an ee.List from trainingPoints.aggregate_array('Species').distinct()
@@ -415,3 +467,4 @@ speciesList.evaluate(function(names) {
  
 // add legend to map (alternatively you can also print the legend to the console)
 Map.add(legend);
+
