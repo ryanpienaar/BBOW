@@ -1,0 +1,119 @@
+extensions [ vid ]
+
+
+turtles-own [energy]
+
+globals [
+      basemap
+    ]
+
+to setup
+  clear-all
+  setup-patches
+  setup-turtles
+  reset-ticks
+  if vid:recorder-status = "recording" [ vid:record-view ]
+end
+
+
+
+to setup-patches
+  ask patches [ set pcolor black ]  ; reset all patches
+  ask n-of oak-density patches [
+    set pcolor green
+  ]
+end
+
+to setup-turtles
+  create-turtles number [ setxy random-xcor random-ycor ]
+end
+
+
+
+to go
+  if ticks >= 500 [ stop ]
+  if count turtles = 0 [ stop ]
+  move-turtles
+  eat-grass
+  check-death
+  reproduce
+  ;regrow-grass
+  tick
+  if vid:recorder-status = "recording" [ vid:record-view ]
+end
+
+
+to move-turtles
+  ask turtles [
+    right random 360
+    forward 1
+    set energy energy - 1
+  ]
+end
+
+to eat-grass
+  ask turtles [
+    if pcolor = green [
+      set pcolor brown
+      set energy (energy + energy-from-grass)
+    ]
+    ifelse show-energy?
+      [ set label energy ]
+      [ set label "" ]
+  ]
+end
+
+to reproduce
+  ask turtles [
+    if energy > birth-energy [
+      set energy energy - birth-energy
+      hatch 1 [ set energy birth-energy ]
+    ]
+  ]
+end
+
+to check-death
+  ask turtles [
+    if energy <= 0 [ die ]
+  ]
+end
+
+;to regrow-grass
+;  ask patches [
+;    if random 100 < 3 [ set pcolor green ]
+;  ]
+;end
+
+
+to start-recorder
+  carefully [ vid:start-recorder ] [ user-message error-message ]
+end
+
+to reset-recorder
+  let message (word
+    "If you reset the recorder, the current recording will be lost."
+    "Are you sure you want to reset the recorder?")
+  if vid:recorder-status = "inactive" or user-yes-or-no? message [
+    vid:reset-recorder
+  ]
+end
+
+to save-recording
+  if vid:recorder-status = "inactive" [
+    user-message "The recorder is inactive. There is nothing to save."
+    stop
+  ]
+  ; prompt user for movie location
+  user-message (word
+    "Choose a name for your movie file (the "
+    ".mp4 extension will be automatically added).")
+  let path user-new-file
+  if not is-string? path [ stop ]  ; stop if user canceled
+  ; export the movie
+  carefully [
+    vid:save-recording path
+    user-message (word "Exported movie to " path ".")
+  ] [
+    user-message error-message
+  ]
+end
