@@ -366,20 +366,56 @@ Export.table.toDrive({
 
 print(training)
 
-// Step 2: Randomly split data (70% training, 30% testing)
-var withRandom = training.randomColumn('random');
-var split = 0.7;
-var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
-var testSet = withRandom.filter(ee.Filter.gte('random', split));
+// // Step 2: Randomly split data (70% training, 30% testing)
+// var withRandom = training.randomColumn('random');
+// var split = 0.7;
+// var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
+// var testSet = withRandom.filter(ee.Filter.gte('random', split));
 
-// Step 3: Train classifier on the training set
+// // Step 3: Train classifier on the training set
+// var classifier = ee.Classifier.smileRandomForest(50).train({
+//   features: trainingSet,
+//   classProperty: 'class',
+//   inputProperties: seasonMetrics.bandNames()
+// });
+
+////////////////////////////////////////////////////////////////
+// Step 1: Add random column for reproducibility
+var withRandom = training.randomColumn('random');
+
+// Step 2: Get the list of unique classes
+var classValues = withRandom.aggregate_array('class').distinct();
+
+// Step 3: Determine the minimum class count (to balance)
+var classCounts = classValues.map(function(classValue) {
+  var count = withRandom.filter(ee.Filter.eq('class', classValue)).size();
+  return ee.Feature(null, {class: classValue, count: count});
+});
+var classCountFC = ee.FeatureCollection(classCounts);
+
+var minCount = classCountFC.aggregate_min('count');
+
+// Step 4: Stratified sampling — equal number from each class
+var balancedTraining = classValues.map(function(classValue) {
+  classValue = ee.Number(classValue);
+  var classSubset = withRandom.filter(ee.Filter.eq('class', classValue));
+  return classSubset.limit(minCount);
+});
+balancedTraining = ee.FeatureCollection(balancedTraining).flatten();
+
+// Step 5: Split balanced training into training and test sets
+var balancedWithRandom = balancedTraining.randomColumn('random');
+var split = 0.7;
+var trainingSet = balancedWithRandom.filter(ee.Filter.lt('random', split));
+var testSet = balancedWithRandom.filter(ee.Filter.gte('random', split));
+
+// Step 6: Train classifier using balanced training set
 var classifier = ee.Classifier.smileRandomForest(50).train({
   features: trainingSet,
   classProperty: 'class',
   inputProperties: seasonMetrics.bandNames()
 });
-
-
+/////////////////////////////////////////////////////////////////////////////////
 
 // Print variable importance
 print('Variable importance:', classifier.explain());
