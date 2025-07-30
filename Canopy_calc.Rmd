@@ -24,7 +24,7 @@ library(tidyverse)
 ```{r}
 # Load your CSV
 df <- read.csv("Trees_Sites.csv")  # Replace with your actual file path
-canopy <- read_csv("CanopyHeightMonica.csv") # This is an extraction from GEDI canopy height layer
+#canopy <- read_csv("CanopyHeightMonica.csv") # This is an extraction from GEDI canopy height layer
 
 ```
 
@@ -126,24 +126,24 @@ maxlong <- -90.50  # east of Devils Island
 # Specifying the date range
 daterange=c("2021-01-01","2021-01-31")
 
-# Get path to GEDI data
-gLevel2A <- gedifinder(
-  product = "GEDI02_A",
-  ul_lat = maxlat,
-  ul_lon = minlong,
-  lr_lat = minlat,
-  lr_lon = maxlong,
-  version = "002",
-  daterange = c("2021-01-01", "2021-12-31")
-)
-
-# Just use the first few files
-gLevel2A_subset <- gLevel2A[1:5]  # for example, take just 5 files
+# # Get path to GEDI data
+# gLevel2A <- gedifinder(
+#   product = "GEDI02_A",
+#   ul_lat = maxlat,
+#   ul_lon = minlong,
+#   lr_lat = minlat,
+#   lr_lon = maxlong,
+#   version = "002",
+#   daterange = c("2021-01-01", "2021-12-31")
+# )
+# 
+# # Just use the first few files
+# gLevel2A_subset <- gLevel2A[1:5]  # for example, take just 5 files
 ```
 
 ```{r}
 
-gediDownload(filepath = gLevel2A, outdir = "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI")
+#gediDownload(filepath = gLevel2A, outdir = "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI")
 
 ```
 
@@ -152,22 +152,22 @@ gediDownload(filepath = gLevel2A, outdir = "Y:/rpienaar/Apostle Islands/Original
 # Read one file (update the filename to match one you downloaded)
 #l2a_path <- "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI/GEDI02_A_2021002075338_O11657_02_T08968_02_003_02_V002.h5"
 
-# List all GEDI L2A files in the folder
-files <- list.files("Y:/rpienaar/Apostle Islands/Original Data Files/GEDI", 
-                    pattern = "\\.h5$", full.names = TRUE)
-
-# Function to read and clip each file
-read_clip_file <- function(file) {
-  gedi_l2a <- readLevel2A(file)
-  level2a <- getLevel2AM(gedi_l2a)
-  clipped <- clipLevel2AM(level2a, xmin = minlong, xmax = maxlong, ymin = minlat, ymax = maxlat)
-  as.data.frame(clipped)
-}
-
-level2a_all <- bind_rows(lapply(files, read_clip_file))
-
-
-head(level2a_all[,c("beam","shot_number","elev_highestreturn","elev_lowestmode","rh100")])
+# # List all GEDI L2A files in the folder
+# files <- list.files("Y:/rpienaar/Apostle Islands/Original Data Files/GEDI", 
+#                     pattern = "\\.h5$", full.names = TRUE)
+# 
+# # Function to read and clip each file
+# read_clip_file <- function(file) {
+#   gedi_l2a <- readLevel2A(file)
+#   level2a <- getLevel2AM(gedi_l2a)
+#   clipped <- clipLevel2AM(level2a, xmin = minlong, xmax = maxlong, ymin = minlat, ymax = maxlat)
+#   as.data.frame(clipped)
+# }
+# 
+# level2a_all <- bind_rows(lapply(files, read_clip_file))
+# 
+# 
+# head(level2a_all[,c("beam","shot_number","elev_highestreturn","elev_lowestmode","rh100")])
 
 
 
@@ -244,10 +244,8 @@ df <- df %>%
 
 
 head(df)
-head(canopy)
-colnames(canopy)[3] <- "Site"
 
-canopy_trees <- df |> filter(Height >= 20) # consider changing this
+canopy_trees <- df |> filter(Height >= 15) # consider changing this
 
 ```
 
@@ -285,7 +283,10 @@ canopy_proportion <- species_canopy %>%
 
 ### Dominant species stands
 stands <- filter(canopy_proportion, proportion >= 0.5)
-write.csv(stands, "Stands.csv")
+head(stands)
+stands$Species <- as.factor(stands$Species)
+summary(stands$Species)
+#write.csv(stands, "Stands.csv")
 
 ```
 
@@ -319,11 +320,14 @@ Load NPS data
 ```{r}
 
 NPS <- read_csv("Y:/rpienaar/Apostle Islands/InputData/APIS_Veg_2021.csv")
+NPS <- read_csv("Y:/rpienaar/Apostle Islands/InputData/TransectLocs.csv")
 
 
-NPSCanopy <- read.csv("CanopyHeightNPS.csv")
 
-colnames(NPSCanopy)[2] <- "Plot"
+
+#NPSCanopy <- read.csv("CanopyHeightNPS.csv")
+
+#colnames(NPSCanopy)[2] <- "Plot"
 
 
 NPS <- NPS |> mutate(genus= stringr::word(Accepted_LatinName, 1))
@@ -343,7 +347,7 @@ NPS <- NPS %>%
   left_join(genus_common, by = "genus")
 
 
-NPS <- NPS |> select(Accepted_LatinName, Diameter_cm, Status, Plot, genus, common_name, Northing, Easting, Transect )
+NPS <- NPS |> select(Accepted_LatinName, Diameter_cm, Status, Plot, genus, common_name, Transect, SitePair, Northing, Easting )
 
 ```
 Calculate heigth based on model from Monica
@@ -370,7 +374,7 @@ NPS <- NPS |> filter(Status == "Live")
 
 NPScc <- NPS |> filter(Height >= 15)
 
-# Create summary table
+# Create summary table for trees by transects
 summary_table <- NPScc %>%
   group_by(Plot, Accepted_LatinName, Transect) %>%
   summarise(Count = n(), .groups = "drop") %>%
@@ -385,23 +389,23 @@ NPScc$canopy <- NPScc$DBH^2
 
 # Summarize by species at each site
 NPSspecies_canopy <- NPScc %>%
-  group_by(Plot, Species) %>%
+  group_by(SitePair, Species) %>%
   summarise(species_area = sum(canopy, na.rm = TRUE), .groups = "drop")
 
 # Total canopy area per site
 NPStotal_canopy <- NPSspecies_canopy %>%
-  group_by(Plot) %>%
+  group_by(SitePair) %>%
   summarise(total_area = sum(species_area), .groups = "drop")
 
 #Add site coords back
 NPSsite_coords <- NPS %>%
-  select(Plot, Northing, Easting) %>%
+  select(SitePair, Northing, Easting) %>%
   distinct()
 
 NPScanopy_proportion <- NPSspecies_canopy %>%
-  left_join(NPStotal_canopy, by = "Plot") %>%
+  left_join(NPStotal_canopy, by = "SitePair") %>%
   mutate(proportion = species_area / total_area) %>%
-  left_join(NPSsite_coords, by = "Plot")  # <-- this keeps the lat/long
+  left_join(NPSsite_coords, by = "SitePair")  # <-- this keeps the lat/long
 
 NPScanopy_proportion$Northing <- as.numeric(NPScanopy_proportion$Northing)
 
@@ -429,9 +433,7 @@ Now I have the 2 files of the 2 sources with the proportions of canopy cover, I 
 
 
 
-head(canopy_proportion)
 
-head(NPScanopy_proportion)
 NPScanopy_proportion <- na.omit(NPScanopy_proportion)
 crs_utm <- 32615  
 # Convert UTM to lat long
@@ -454,8 +456,12 @@ head(NPSprop)
 #rename cols
 colnames(NPSprop)[1] <- "Site"
 Combo <- rbind(canopy_proportion, NPSprop)
-Combo <- Combo |> filter(!Species %in% c("Ash", "Balsam", "Basswood", "Beech"))
+
 Combo$Species <- as.factor(Combo$Species)
+
+summary(Combo$Species)
+
+Combo <- Combo |> filter(!Species %in% c("Ash", "Balsam", "Basswood", "Beech", "Spruce"))
 
 summary(Combo$Species)
 
@@ -492,7 +498,7 @@ Summary of data I have
 ```{r}
 library(gt)
 
-Combo |> pivot_longer(cols = Aspen:Hemlock, names_to = "Species", values_to = "Cover") %>%
+Combo |> pivot_longer(cols = Cedar:Hemlock, names_to = "Species", values_to = "Cover") %>%
   mutate(
     Category = case_when(
       Cover == 1 ~ "Pure stands",
