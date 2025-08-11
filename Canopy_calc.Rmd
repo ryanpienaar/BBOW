@@ -23,7 +23,7 @@ library(tidyverse)
 
 ```{r}
 # Load your CSV
-df <- read.csv("Trees_Sites.csv")  # Replace with your actual file path
+df <- read.csv("Trees_Sites.csv")  
 #canopy <- read_csv("CanopyHeightMonica.csv") # This is an extraction from GEDI canopy height layer
 
 ```
@@ -126,48 +126,48 @@ maxlong <- -90.50  # east of Devils Island
 # Specifying the date range
 daterange=c("2021-01-01","2021-01-31")
 
-# # Get path to GEDI data
-# gLevel2A <- gedifinder(
-#   product = "GEDI02_A",
-#   ul_lat = maxlat,
-#   ul_lon = minlong,
-#   lr_lat = minlat,
-#   lr_lon = maxlong,
-#   version = "002",
-#   daterange = c("2021-01-01", "2021-12-31")
-# )
-# 
-# # Just use the first few files
-# gLevel2A_subset <- gLevel2A[1:5]  # for example, take just 5 files
+# Get path to GEDI data
+gLevel2A <- gedifinder(
+  product = "GEDI02_A",
+  ul_lat = maxlat,
+  ul_lon = minlong,
+  lr_lat = minlat,
+  lr_lon = maxlong,
+  version = "002",
+  daterange = c("2021-01-01", "2021-12-31")
+)
+
+# Just use the first few files
+gLevel2A_subset <- gLevel2A[1:5]  # for example, take just 5 files
 ```
 
 ```{r}
 
-#gediDownload(filepath = gLevel2A, outdir = "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI")
+gediDownload(filepath = gLevel2A, outdir = "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI")
 
 ```
 
 ```{r}
 
 # Read one file (update the filename to match one you downloaded)
-#l2a_path <- "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI/GEDI02_A_2021002075338_O11657_02_T08968_02_003_02_V002.h5"
+l2a_path <- "Y:/rpienaar/Apostle Islands/Original Data Files/GEDI/GEDI02_A_2021002075338_O11657_02_T08968_02_003_02_V002.h5"
 
-# # List all GEDI L2A files in the folder
-# files <- list.files("Y:/rpienaar/Apostle Islands/Original Data Files/GEDI", 
-#                     pattern = "\\.h5$", full.names = TRUE)
-# 
-# # Function to read and clip each file
-# read_clip_file <- function(file) {
-#   gedi_l2a <- readLevel2A(file)
-#   level2a <- getLevel2AM(gedi_l2a)
-#   clipped <- clipLevel2AM(level2a, xmin = minlong, xmax = maxlong, ymin = minlat, ymax = maxlat)
-#   as.data.frame(clipped)
-# }
-# 
-# level2a_all <- bind_rows(lapply(files, read_clip_file))
-# 
-# 
-# head(level2a_all[,c("beam","shot_number","elev_highestreturn","elev_lowestmode","rh100")])
+ # List all GEDI L2A files in the folder
+ files <- list.files("Y:/rpienaar/Apostle Islands/Original Data Files/GEDI",
+                     pattern = "\\.h5$", full.names = TRUE)
+
+ # Function to read and clip each file
+ read_clip_file <- function(file) {
+   gedi_l2a <- readLevel2A(file)
+   level2a <- getLevel2AM(gedi_l2a)
+   clipped <- clipLevel2AM(level2a, xmin = minlong, xmax = maxlong, ymin = minlat, ymax = maxlat)
+   as.data.frame(clipped)
+ }
+
+ level2a_all <- bind_rows(lapply(files, read_clip_file))
+
+
+head(level2a_all[,c("beam","shot_number","elev_highestreturn","elev_lowestmode","rh100")])
 
 
 
@@ -303,7 +303,7 @@ ggplot(data= df, aes(x= DBH, y =Height, colour = Species))+
 mod <- glm(Height ~ DBH * Species, data = df)
 
 # Inspect the model
-tab_model(mod)
+#tab_model(mod)
 
 # Define canopy height threshold
 cutoff <- mean(canopy_trees$Height, na.rm = TRUE) + sd(canopy_trees$Height, na.rm = TRUE)
@@ -407,7 +407,7 @@ NPScanopy_proportion <- NPSspecies_canopy %>%
   mutate(proportion = species_area / total_area) %>%
   left_join(NPSsite_coords, by = "SitePair")  # <-- this keeps the lat/long
 
-NPScanopy_proportion$Northing <- as.numeric(NPScanopy_proportion$Northing)
+#NPScanopy_proportion$Northing <- as.numeric(NPScanopy_proportion$Northing)
 
 ```
 
@@ -432,19 +432,20 @@ Now I have the 2 files of the 2 sources with the proportions of canopy cover, I 
 ```{r}
 
 
-
+head(NPScanopy_proportion)
 
 NPScanopy_proportion <- na.omit(NPScanopy_proportion)
-crs_utm <- 32615  
-# Convert UTM to lat long
-dfutmsf <- st_as_sf(NPScanopy_proportion, coords = c("Northing", "Easting"), crs = crs_utm)
+crs_utm <- 32615  # UTM zone 15N
+
+# Convert UTM to lat long with correct coordinate order
+dfutmsf <- st_as_sf(NPScanopy_proportion, coords = c("Easting", "Northing"), crs = crs_utm)
 
 dflatlong <- st_transform(dfutmsf, crs = 4326)
 
 # Extract lat/long into columns
 NPSprop <- dflatlong %>%
   mutate(Lat = st_coordinates(.)[,2],
-          Long = st_coordinates(.)[,1]) %>%
+         Long = st_coordinates(.)[,1]) %>%
   st_drop_geometry()
 
 
@@ -488,8 +489,8 @@ Combo[is.na(Combo)] <- 0
 head(Combo)
 
 
-#write.csv(ComboDom, "SpeciesClass.csv", row.names = FALSE)
-#write.csv(Combo, "SpeciesProps.csv", row.names = FALSE)
+write.csv(ComboDom, "SpeciesClass.csv", row.names = FALSE)
+write.csv(Combo, "SpeciesProps.csv", row.names = FALSE)
 
 ```
 
@@ -527,4 +528,6 @@ Finish
 
 
 ```
+
+
 
