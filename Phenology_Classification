@@ -5,12 +5,12 @@ Map.centerObject(geometry, 10);
 //Plot NPS points
 // -----------------------------------
 
-// Assuming your FeatureCollection is named `points`
-var filteredPoints = newdata.filter(ee.Filter.stringStartsWith('Site', '1'));
+// // Assuming your FeatureCollection is named `points`
+// var filteredPoints = newdata.filter(ee.Filter.stringStartsWith('Site', '1'));
 
-// Check the results
-print('Filtered points:', filteredPoints);
-Map.addLayer(filteredPoints, {}, 'Sites starting with 1');
+// // Check the results
+// print('Filtered points:', filteredPoints);
+// Map.addLayer(filteredPoints, {}, 'Sites starting with 1');
 
 
 // -----------------------------------
@@ -78,7 +78,7 @@ function addEVI(image) {
     '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
       'NIR': image.select('B5'),   // NIR
       'RED': image.select('B4'),   // Red
-      'BLUE': image.select('B3')   // Blue
+      'BLUE': image.select('B2')   // Blue
     }).rename('EVI');
   return image.addBands(evi).copyProperties(image, ['system:time_start']);
 }
@@ -131,9 +131,9 @@ var hls = hlsl.merge(hlss).sort('system:time_start');
 
 // var hls = hlss.sort('system:time_start');
 
-print("n Images", hls.size())
+// print("n Images", hls.size())
 
-print("HLS Bands", hls.first().bandNames())
+// print("HLS Bands", hls.first().bandNames())
 
 
 
@@ -304,124 +304,94 @@ print('Bands:', seasonMetrics.bandNames());
 //Map.addLayer (seasonMetrics)
 
 
+///////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////
+
 // ---------------------------------------------
 // Supervised classification
 // ---------------------------------------------
 
-var points = newdata
+// Load points
+var points = newdata;
 
+// Remove unwanted species
+points = points
+  .filter(ee.Filter.neq('Species', 'Cedar'))
+  .filter(ee.Filter.neq('Species', 'Pine'));
 
-// Add a random value column (between 0 and 1)
-var withRandom = points.randomColumn('random');
+// Check species counts
+print('Species counts:', points.aggregate_histogram('Species'));
 
-// Define training and testing sets
-var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
-var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
-
-print(trainingPoints.first());
-
-// Load your imagery
-var image = seasonMetrics; // already defined
-
-Map.addLayer( trainingPoints, {}, "Points")
-// Create unique numeric variable for each species
-
-// 2.1. Get the unique species names
-var speciesList = trainingPoints.aggregate_array('Species').distinct();
-
-print(speciesList)
-
-// 2.2. Create a lookup dictionary: e.g., {'BASS': 0, 'FIR': 1, 'OAK': 2, ...}
+// Create numeric label mapping for species
+var speciesList = points.aggregate_array('Species').distinct();
 var speciesDict = ee.Dictionary.fromLists(
-  speciesList,                 // keys
-  ee.List.sequence(0, speciesList.length().subtract(1)) // values
+  speciesList,
+  ee.List.sequence(0, speciesList.length().subtract(1))
 );
 
-print(speciesDict)
-
-var trainingPointsLabeled = trainingPoints.map(function(feature) {
-  var species = feature.get('Species');
-  var classNum = (speciesDict.get(species)); // get index and cast to ee.Number
-  return feature.set('class', classNum);
+// Add numeric class field
+var pointsLabeled = points.map(function(feature) {
+  return feature.set('class', speciesDict.get(feature.get('Species')));
 });
 
-print("Training Points Labeled",trainingPointsLabeled)
-
-
-
-var training = seasonMetrics.sampleRegions({
-  collection: trainingPointsLabeled,
+// Sample imagery
+var trainingSamples = seasonMetrics.sampleRegions({
+  collection: pointsLabeled,
   properties: ['class'],
+  geometries: true,
   scale: 30
 });
 
-print('First sampled feature:', training.first());
-
-Export.table.toDrive({
-  collection: training,
-  description: 'training_export_with_bands',
-  fileFormat: 'CSV',
-  selectors: training.first().propertyNames()  // exports all properties
-});
-
-print(training)
-
-// // Step 2: Randomly split data (70% training, 30% testing)
-// var withRandom = training.randomColumn('random');
-// var split = 0.7;
-// var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
-// var testSet = withRandom.filter(ee.Filter.gte('random', split));
-
-// // Step 3: Train classifier on the training set
-// var classifier = ee.Classifier.smileRandomForest(50).train({
-//   features: trainingSet,
-//   classProperty: 'class',
-//   inputProperties: seasonMetrics.bandNames()
-// });
-
-////////////////////////////////////////////////////////////////
-// Step 1: Add random column for reproducibility
-var withRandom = training.randomColumn('random');
-
-// Step 2: Get the list of unique classes
-var classValues = withRandom.aggregate_array('class').distinct();
-
-// Step 3: Determine the minimum class count (to balance)
+// Balance classes
+var classValues = trainingSamples.aggregate_array('class').distinct();
 var classCounts = classValues.map(function(classValue) {
-  var count = withRandom.filter(ee.Filter.eq('class', classValue)).size();
+  var count = trainingSamples.filter(ee.Filter.eq('class', classValue)).size();
   return ee.Feature(null, {class: classValue, count: count});
 });
-var classCountFC = ee.FeatureCollection(classCounts);
+var minCount = ee.FeatureCollection(classCounts).aggregate_min('count');
 
-var minCount = classCountFC.aggregate_min('count');
+// Stratified sampling: equal number per class, sorted by 'proportion'
+var balancedTraining = ee.FeatureCollection(
+  classValues.map(function(classValue) {
+    return trainingSamples
+      .filter(ee.Filter.eq('class', classValue))
+      .sort('proportion', false) // highest proportion first
+      .limit(minCount);
+  })
+).flatten();
 
-// Step 4: Stratified sampling — equal number from each class
-var balancedTraining = classValues.map(function(classValue) {
-  classValue = ee.Number(classValue);
-  var classSubset = withRandom.filter(ee.Filter.eq('class', classValue));
-  return classSubset.limit(minCount);
-});
-balancedTraining = ee.FeatureCollection(balancedTraining).flatten();
-
-// Step 5: Split balanced training into training and test sets
+// Final split from balanced data
 var balancedWithRandom = balancedTraining.randomColumn('random');
 var split = 0.7;
-var trainingSet = balancedWithRandom.filter(ee.Filter.lt('random', split));
-var testSet = balancedWithRandom.filter(ee.Filter.gte('random', split));
+var finalTrainingSet = balancedWithRandom.filter(ee.Filter.lt('random', split));
+var finalTestSet     = balancedWithRandom.filter(ee.Filter.gte('random', split));
 
-// Step 6: Train classifier using balanced training set
+// Train classifier
 var classifier = ee.Classifier.smileRandomForest(50).train({
-  features: trainingSet,
+  features: finalTrainingSet,
   classProperty: 'class',
   inputProperties: seasonMetrics.bandNames()
 });
+
+// Outputs
+print('Balanced class counts:', balancedTraining.aggregate_histogram('class'));
+print('Training set', finalTrainingSet);
+print('Test set', finalTestSet);
+
+// Output samples and sets for inspection
+print('Final training set', finalTrainingSet);
+print('Final test set', finalTestSet);
+
 /////////////////////////////////////////////////////////////////////////////////
 
 // Print variable importance
 print('Variable importance:', classifier.explain());
 
 // Step 4: Classify the test set
-var validated = testSet.classify(classifier);
+var validated = finalTestSet.classify(classifier);
 
 // Step 5: Generate confusion matrix
 var confMatrix = validated.errorMatrix('class', 'classification');
@@ -498,7 +468,7 @@ var makeRow = function(color, name) {
  
 //  Palette with the colors
 var palette = [
- 'e41a1c', // red
+'e41a1c', // red
   '377eb8', // blue
   '4daf4a', // green
   '984ea3', // purple
