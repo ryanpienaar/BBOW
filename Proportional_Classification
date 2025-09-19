@@ -385,8 +385,19 @@ var trainingPA = training.map(function(f) {
 // -----------------------
 // 2. Stage 1: Classification model (presence/absence)
 // -----------------------
+// var rfClass = ee.Classifier.smileRandomForest(500)
+//   .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
+//   .train({
+//     features: trainingPA,
+//     classProperty: 'presence',
+//     inputProperties: seasonMetrics.bandNames()
+//   });
+
+// // Predict probability of oak presence
+// var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
+
 var rfClass = ee.Classifier.smileRandomForest(500)
-  .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
+  .setOutputMode('PROBABILITY')  // now works, since 'presence' is 0/1
   .train({
     features: trainingPA,
     classProperty: 'presence',
@@ -394,7 +405,7 @@ var rfClass = ee.Classifier.smileRandomForest(500)
   });
 
 // Predict probability of oak presence
-var probPresence = seasonMetrics.classify(rfClass).rename(species + '_prob');
+var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
 
 
 var test = probPresence.sampleRegions({
@@ -402,23 +413,20 @@ var test = probPresence.sampleRegions({
     properties: [species],
     scale: 30
   });
-
-// Add a binary "observed presence" column to testing data
+  
 var testPA = test.map(function(f) {
   var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
-  return f.set('obs', obs);
+  return f.set(species +'_obs', obs);
 });
 
-print('TestPA', testPA)
 
-// Add a binary prediction column using threshold = 0.5
-var testClassified = testPA.map(function(f) {
-  var pred = ee.Number(f.get(species)).gt(0.1).int();
-  return f.set('pred', pred);
-});
 
-// Build confusion matrix
-var confusionMatrix = testClassified.errorMatrix('obs', 'pred');
+print("Test", test)
+print("TestPA", testPA)
+
+
+//Build confusion matrix
+var confusionMatrix = testPA.errorMatrix(species+ '_obs', species+ '_pred');
 print('Confusion Matrix ' +species, confusionMatrix);
 print('Presence Accuracy ' +species, confusionMatrix.accuracy());
 print('Kappa ' +species, confusionMatrix.kappa());
