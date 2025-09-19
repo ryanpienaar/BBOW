@@ -1,5 +1,14 @@
 // Display AOI
 Map.centerObject(geometry, 11);
+Map.addLayer(newdata)
+
+// Filter points that fall inside the polygon
+var newdata = newdata.filterBounds(geometry)
+print('Number of points inside polygon:', newdata.size());
+
+newdata = newdata.randomColumn("rand");
+//newdata = newdata.sort("rand").limit(150);
+print(newdata)
 
 // -----------------------------------
 //general functions
@@ -66,10 +75,50 @@ function addEVI(image) {
     '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
       'NIR': image.select('B5'),   // NIR
       'RED': image.select('B4'),   // Red
-      'BLUE': image.select('B3')   // Blue
+      'BLUE': image.select('B2')   // Blue
     }).rename('EVI');
   return image.addBands(evi).copyProperties(image, ['system:time_start']);
 }
+
+// -----------------------------------
+// Tassel cap index
+// -----------------------------------
+
+// Compute Tasseled Cap for HLS (using OLI coefficients)
+function tasseledCap(image) {
+  var bands = ['B2','B3','B4','B5','B6','B7']; // Blue, Green, Red, NIR, SWIR1, SWIR2
+  var brightness = image.expression(
+    '0.3029*B2 + 0.2786*B3 + 0.4733*B4 + 0.5599*B5 + 0.5080*B6 + 0.1872*B7',
+    {'B2': image.select('B2'),
+     'B3': image.select('B3'),
+     'B4': image.select('B4'),
+     'B5': image.select('B5'),
+     'B6': image.select('B6'),
+     'B7': image.select('B7')});
+
+  var greenness = image.expression(
+    '-0.2941*B2 -0.2430*B3 -0.5424*B4 +0.7276*B5 +0.0713*B6 -0.1608*B7',
+    {'B2': image.select('B2'),
+     'B3': image.select('B3'),
+     'B4': image.select('B4'),
+     'B5': image.select('B5'),
+     'B6': image.select('B6'),
+     'B7': image.select('B7')});
+
+  var wetness = image.expression(
+    '0.1511*B2 +0.1973*B3 +0.3283*B4 +0.3407*B5 -0.7117*B6 -0.4559*B7',
+    {'B2': image.select('B2'),
+     'B3': image.select('B3'),
+     'B4': image.select('B4'),
+     'B5': image.select('B5'),
+     'B6': image.select('B6'),
+     'B7': image.select('B7')});
+
+  return image.addBands([brightness.rename('TCB'),
+                         greenness.rename('TCG'),
+                         wetness.rename('TCW')]);
+}
+
 
 // -----------------------------------
 //change S2-band names
@@ -88,6 +137,7 @@ var hlsl = ee.ImageCollection('NASA/HLS/HLSL30/v002')
   .map(cloudMask_HLS)
   .map(hansenWaterMask)
   .map(addEVI)
+  .map(tasseledCap)
   //.select("EVI")
   .map(function(image) {
     return image.updateMask(forestMask);
@@ -105,6 +155,7 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
   .map(hansenWaterMask)
   .map(changeNames)
   .map(addEVI)
+  .map(tasseledCap)
   //.select("EVI")
   .map(function(image) {
     return image.updateMask(forestMask);
@@ -116,6 +167,8 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
 
 // Merge and sort
 var hls = hlsl.merge(hlss).sort('system:time_start');
+
+//var hls = tasseledCap(hls);
 
 print("n Images", hls.size())
 
@@ -155,7 +208,7 @@ var coeffs = harmonicFit.select('coefficients')
   .arrayProject([0])
   .arrayFlatten([['a', 'b', 'c']]);
 
-//print('Harmonic Coefficients:', coeffs);
+print('Harmonic Coefficients:', coeffs);
 
 // -------------------------------
 //Predict EVI Using Harmonic Model
@@ -173,7 +226,7 @@ function predictEVI(day) {
   return pred.set('system:time_start', start.advance(day, 'day').millis());
 }
 
-var days = ee.List.sequence(0, 364, 8);  // every 8 days
+var days = ee.List.sequence(0, 364, 8);  // every 8 days 
 var fittedEVI_HM = ee.ImageCollection.fromImages(days.map(predictEVI))
 .map(function(img) {
     var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1); // 1-based DOY
@@ -226,10 +279,10 @@ var los = eos.subtract(sos).rename('LOS');
 // Bands in Classification
 //----------------------------------------------
 var seasonMetrics = sos.rename('SOS')
-  //.addBands(eos.rename('EOS'))
-  //.addBands(pos.rename('POS'))
-  //.addBands(peakEVI.rename('PeakEVI'))
-  //.addBands(los); 
+  .addBands(eos.rename('EOS'))
+  .addBands(pos.rename('POS'))
+  .addBands(peakEVI.rename('PeakEVI'))
+  .addBands(los); 
   
 // Add EVI metrics too
 // Compute mean EVI
@@ -249,7 +302,7 @@ seasonMetrics = seasonMetrics
   .addBands(rangeEVI);
   
 // Define the bands you want to compute range for
-var bands = ['B2', 'B3', 'B5'];
+var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', "TCB", 'TCG', 'TCW'];
 
 // Function to calculate mean, stdDev, and range for a single band
 var summarizeBand = function(band) {
@@ -268,14 +321,19 @@ var summaryBands = ee.Image.cat(
 // Add the summary stats to your existing seasonMetrics image
 seasonMetrics = seasonMetrics.addBands(summaryBands);
   
+//seasonMetrics = seasonMetrics.select("EVI_mean", "SOS", "EOS", "PeakEVI", "POS", "LOS")
+  
 print('Bands:', seasonMetrics.bandNames());
+Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 
-// ---------------------------------------------
-// Supervised classification
-// ---------------------------------------------
+///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
 
 var points = newdata
-
 
 // Add a random value column (between 0 and 1)
 var withRandom = points.randomColumn('random');
@@ -284,17 +342,19 @@ var withRandom = points.randomColumn('random');
 var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
 var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
 
-print(trainingPoints.first());
 
-// Load your imagery
-var image = seasonMetrics; // already defined
-
+// Add a random value column (between 0 and 1)
+// Add a random column with a fixed seed
+var withRandom = points.randomColumn('random', 42);  // 'random' is column name, 42 is seed
+// Define color palette
+var palette = ['white', 'green'];
 
 // ---------------------------------------------
 // Dominance Map
 // ---------------------------------------------
 // Define your species list
-var speciesList = ["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech"];
+var speciesList = ["Aspen", "Maple", "Oak", "Birch", "Hemlock", "Pine", "Cedar"];
+var speciesList = [ "Maple", "Oak"];
 
 // Define color palette
 var palette = ['white', 'green'];
@@ -304,33 +364,98 @@ var predictionLayers = {};  // This is a plain JS object
 
 speciesList.forEach(function(species) {
 
-  // Sample training points
-  var training = seasonMetrics.sampleRegions({
-    collection: trainingPoints,
+  // -----------------------
+// 1. Prepare training data
+// -----------------------
+var training = seasonMetrics.sampleRegions({
+  collection: trainingPoints,
+  properties: [species],
+  scale: 30
+});
+
+// Create a binary presence/absence column
+// (assuming species column is proportion between 0–1)
+var trainingPA = training.map(function(f) {
+  var pa = ee.Number(f.get(species)).gt(0).int(); // ensures 0 or 1 integer
+  return f.set('presence', pa);
+});
+
+  //print('TrainingPA', trainingPA)
+
+// -----------------------
+// 2. Stage 1: Classification model (presence/absence)
+// -----------------------
+var rfClass = ee.Classifier.smileRandomForest(500)
+  .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
+  .train({
+    features: trainingPA,
+    classProperty: 'presence',
+    inputProperties: seasonMetrics.bandNames()
+  });
+
+// Predict probability of oak presence
+var probPresence = seasonMetrics.classify(rfClass).rename(species + '_prob');
+
+
+var test = probPresence.sampleRegions({
+    collection: testingPoints,
     properties: [species],
     scale: 30
   });
 
-  // Train RF model
-  var rf = ee.Classifier.smileRandomForest(50)
-    .setOutputMode('REGRESSION')
-    .train({
-      features: training,
-      classProperty: species,
-      inputProperties: seasonMetrics.bandNames()
-    });
+// Add a binary "observed presence" column to testing data
+var testPA = test.map(function(f) {
+  var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
+  return f.set('obs', obs);
+});
 
-  // Predict
-  var prediction = seasonMetrics.classify(rf).rename(species + '_pred');
+print('TestPA', testPA)
 
-  // Save prediction layer as object entry
-  predictionLayers[species] = prediction;
+// Add a binary prediction column using threshold = 0.5
+var testClassified = testPA.map(function(f) {
+  var pred = ee.Number(f.get(species)).gt(0.1).int();
+  return f.set('pred', pred);
+});
+
+// Build confusion matrix
+var confusionMatrix = testClassified.errorMatrix('obs', 'pred');
+print('Confusion Matrix ' +species, confusionMatrix);
+print('Presence Accuracy ' +species, confusionMatrix.accuracy());
+print('Kappa ' +species, confusionMatrix.kappa());
+print('Producers Accuracy ' +species, confusionMatrix.producersAccuracy());
+print('Users Accuracy ' +species, confusionMatrix.consumersAccuracy());
+
+
+
+// -----------------------
+// 3. Stage 2: Regression model (only where proportion > 0)
+// -----------------------
+var trainingPositive = training.filter(ee.Filter.gt(species, 0));
+
+var rfReg = ee.Classifier.smileRandomForest(500)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: trainingPositive,
+    classProperty: species,
+    inputProperties: seasonMetrics.bandNames()
+  });
+
+// Predict oak proportion (conditional on presence)
+var regPrediction = seasonMetrics.classify(rfReg).rename(species + '_reg');
+
+// -----------------------
+// 4. Combine stage 1 & stage 2
+// -----------------------
+// Final prediction = prob(presence) * predicted proportion
+var finalPrediction = probPresence.multiply(regPrediction).rename(species + '_pred');
+
+var prediction = finalPrediction;
 
   // Visualize
   Map.addLayer(prediction, {min: 0, max: 1, palette: palette}, 'Predicted ' + species);
 
   // Variable importance
-  var importance = ee.Dictionary(rf.explain().get('importance'));
+  var importance = ee.Dictionary(rfReg.explain().get('importance'));
   print('Variable importance: ' + species, importance);
 
   // Evaluate on testing data
@@ -340,71 +465,77 @@ speciesList.forEach(function(species) {
     scale: 30
   });
 
-  var predictedTest = testing.classify(rf);
-  var withError = predictedTest.map(function(f) {
-    var observed = ee.Number(f.get(species));
-    var pred = ee.Number(f.get('classification'));
-    var squaredError = observed.subtract(pred).pow(2);
-    return f.set('squaredError', squaredError);
+  // var predictedTest = testing.classify(rf);
+  // var withError = predictedTest.map(function(f) {
+  //   var observed = ee.Number(f.get(species));
+  //   var pred = ee.Number(f.get('classification'));
+  //   var squaredError = observed.subtract(pred).pow(2);
+  //   return f.set('squaredError', squaredError);
+  // });
+
+  // var mse = withError.aggregate_mean('squaredError');
+  // print('MSE for ' + species + ':', mse);
+  
+  
+  // R squared testing
+  var test = prediction.sampleRegions({
+    collection: testingPoints,
+    properties: [species],
+    scale: 30
   });
 
-  var mse = withError.aggregate_mean('squaredError');
-  print('MSE for ' + species + ':', mse);
+print(test)
+
+var chart = ui.Chart.feature.byFeature({
+  features: test,
+  xProperty: species,
+  yProperties: [species + "_pred"]
+})
+.setChartType('ScatterChart')
+.setOptions({
+  title: 'Observed vs Predicted',
+  hAxis: {title: 'Observed '+species +' proportion'},
+  vAxis: {title: 'Predicted classification'},
+  pointSize: 4,
+  trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
+});  
+ 
+ print(chart)
+ 
 });
 
-// Now you can access, for example, the Aspen prediction with:
-print('Aspen prediction layer:', predictionLayers['Aspen']);
 
-// Stack predictions into a multi-band image
-var predictionImage = ee.Image.cat(speciesList.map(function(species) {
-  return predictionLayers[species];
-}));
 
-// Get max value index per pixel
-var maxIndex = predictionImage.toArray().arrayArgmax().arrayGet([0]).rename('dominant_index');
+// // Create scatterplot of Oak vs classification
+// var chart = ui.Chart.feature.byFeature({
+//   features: testing,
+//   xProperty: 'Oak',
+//   yProperties: ['classification']
+// })
+// .setChartType('ScatterChart')
+// .setOptions({
+//   title: 'Observed vs Predicted',
+//   hAxis: {title: 'Observed Oak proportion'},
+//   vAxis: {title: 'Predicted classification'},
+//   pointSize: 4,
+//   trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
+// });
 
-// Optional: visualize with a color palette (assign each species a color)
-var palette = ['e6194b','3cb44b','ffe119','0082c8','f58231','911eb4','46f0f0','f032e6','d2f53c','fabebe','008080','e6beff'];
+// // Print the chart
+// print(chart);
 
-Map.addLayer(maxIndex, {min: 0, max: speciesList.length - 1, palette: palette}, 'Dominant Species (Index)');
 
-// === Legend ===
-var speciesList = ["Aspen", "Maple", "Spruce", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Balsam", "Ash", "Basswood", "Beech"];
-var palette = ['e6194b','3cb44b','ffe119','0082c8','f58231','911eb4','46f0f0','f032e6','d2f53c','fabebe','008080','e6beff'];
+  
+  
+//////////////////////////////////////////////////
+/////////////////////////////////////////////////
+////////////////////////////////////////////////
 
-var legend = ui.Panel({
-  style: {
-    position: 'bottom-left',
-    padding: '8px 15px'
-  }
-});
 
-legend.add(ui.Label({
-  value: 'Dominant Species Legend',
-  style: {
-    fontWeight: 'bold',
-    fontSize: '14px',
-    margin: '0 0 8px 0',
-    padding: '0'
-  }
-}));
-
-for (var i = 0; i < speciesList.length; i++) {
-  var colorBox = ui.Label({
-    style: {
-      backgroundColor: palette[i],
-      padding: '8px',
-      margin: '0 8px 4px 0'
-    }
-  });
-
-  var label = ui.Label({
-    value: speciesList[i],
-    style: {margin: '0 0 4px 0'}
-  });
-
-  legend.add(ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal')));
-}
-
-Map.add(legend);
-
+// Export.image.toDrive({image: prediction,
+// description: "Oak prediction raster export",
+// folder: "BBOW/EE", 
+// scale: 30,
+// fileDimensions: 5000,
+// fileFormat: "GeoTIFF"
+// })
