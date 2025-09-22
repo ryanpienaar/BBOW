@@ -62,7 +62,7 @@ var forestMask = nlcd.remap(forestClasses, [1, 1, 1], 0); // 1 = forest, 0 = non
 // phenology threshold
 // -----------------------------------
 var aoi = geometry
-var year = 2021;
+var year = 2023;
 var start = ee.Date.fromYMD(year, 1, 1);
 var end = ee.Date.fromYMD(year, 12, 31);
 var threshold = 0.30;  // EVI threshold for phenology
@@ -324,7 +324,7 @@ seasonMetrics = seasonMetrics.addBands(summaryBands);
 //seasonMetrics = seasonMetrics.select("EVI_mean", "SOS", "EOS", "PeakEVI", "POS", "LOS")
   
 print('Bands:', seasonMetrics.bandNames());
-Map.addLayer(seasonMetrics, {}, "seasonMetrics")
+//Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 
 ///////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
@@ -336,16 +336,19 @@ Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 var points = newdata
 
 // Add a random value column (between 0 and 1)
-var withRandom = points.randomColumn('random');
+var withRandom = points.randomColumn('random',42);
 
 // Define training and testing sets
 var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
 var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
 
+print('trainingPoints', trainingPoints)
+print('testingPoints', testingPoints)
+
 
 // Add a random value column (between 0 and 1)
 // Add a random column with a fixed seed
-var withRandom = points.randomColumn('random', 42);  // 'random' is column name, 42 is seed
+
 // Define color palette
 var palette = ['white', 'green'];
 
@@ -373,6 +376,8 @@ var training = seasonMetrics.sampleRegions({
   scale: 30
 });
 
+print('training', training)
+
 // Create a binary presence/absence column
 // (assuming species column is proportion between 0–1)
 var trainingPA = training.map(function(f) {
@@ -385,19 +390,8 @@ var trainingPA = training.map(function(f) {
 // -----------------------
 // 2. Stage 1: Classification model (presence/absence)
 // -----------------------
-// var rfClass = ee.Classifier.smileRandomForest(500)
-//   .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
-//   .train({
-//     features: trainingPA,
-//     classProperty: 'presence',
-//     inputProperties: seasonMetrics.bandNames()
-//   });
-
-// // Predict probability of oak presence
-// var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
-
 var rfClass = ee.Classifier.smileRandomForest(500)
-  .setOutputMode('PROBABILITY')  // now works, since 'presence' is 0/1
+  .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
   .train({
     features: trainingPA,
     classProperty: 'presence',
@@ -406,6 +400,17 @@ var rfClass = ee.Classifier.smileRandomForest(500)
 
 // Predict probability of oak presence
 var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
+
+// var rfClass = ee.Classifier.smileRandomForest(50)
+//   .setOutputMode('PROBABILITY')  // now works, since 'presence' is 0/1
+//   .train({
+//     features: trainingPA,
+//     classProperty: 'presence',
+//     inputProperties: seasonMetrics.bandNames()
+//   });
+
+// // Predict probability of oak presence
+// var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
 
 
 var test = probPresence.sampleRegions({
