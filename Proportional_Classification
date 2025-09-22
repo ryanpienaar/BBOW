@@ -390,19 +390,8 @@ var trainingPA = training.map(function(f) {
 // -----------------------
 // 2. Stage 1: Classification model (presence/absence)
 // -----------------------
-var rfClass = ee.Classifier.smileRandomForest(500)
-  .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
-  .train({
-    features: trainingPA,
-    classProperty: 'presence',
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-// Predict probability of oak presence
-var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
-
-// var rfClass = ee.Classifier.smileRandomForest(50)
-//   .setOutputMode('PROBABILITY')  // now works, since 'presence' is 0/1
+// var rfClass = ee.Classifier.smileRandomForest(500)
+//   .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
 //   .train({
 //     features: trainingPA,
 //     classProperty: 'presence',
@@ -412,19 +401,49 @@ var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
 // // Predict probability of oak presence
 // var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
 
-
-var test = probPresence.sampleRegions({
-    collection: testingPoints,
-    properties: [species],
-    scale: 30
+var rfClass = ee.Classifier.smileRandomForest(50)
+  .setOutputMode('PROBABILITY')  
+  .train({
+    features: trainingPA,
+    classProperty: 'presence',
+    inputProperties: seasonMetrics.bandNames()
   });
+
+// Predict probability of oak presence, remove this line when using rf CLASSIFICATION
+var probPresenceProp = seasonMetrics.classify(rfClass).rename(species + '_prop');
+
+var probPresence = probPresenceProp.gt(0.35).rename(species + '_pred');
+
+// This is commented out when using the PROBABILITY rf
+/////////////////////////////////////////////////////////////////
+// var test = probPresence.sampleRegions({
+//     collection: testingPoints,
+//     properties: [species],
+//     scale: 30
+//   });
   
-var testPA = test.map(function(f) {
-  var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
-  return f.set(species +'_obs', obs);
+// var testPA = test.map(function(f) {
+//   var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
+//   return f.set(species +'_obs', obs);
+// });
+////////////////////////////////////////////////////////////////
+
+// This is commented out when using the CLASSIFICATION rf
+/////////////////////////////////////////////////////////////////////
+
+// Sample BOTH probability and thresholded prediction
+var test = probPresenceProp.addBands(probPresence).sampleRegions({
+  collection: testingPoints,
+  properties: [species],
+  scale: 30
 });
 
-
+// Add observed presence as 0/1
+var testPA = test.map(function(f) {
+  var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
+  return f.set(species + '_obs', obs);
+});
+////////////////////////////////////////////////////////////////////
 
 print("Test", test)
 print("TestPA", testPA)
@@ -438,6 +457,57 @@ print('Kappa ' +species, confusionMatrix.kappa());
 print('Producers Accuracy ' +species, confusionMatrix.producersAccuracy());
 print('Users Accuracy ' +species, confusionMatrix.consumersAccuracy());
 
+//////////////////////////////////////////////////////////////////////////////
+// Test for th eoptimal classifcation threshold
+/////////////////////////////////////////////////////////////////////////////
+
+
+// Thresholds to test (step size 0.05, adjust if you want finer resolution)
+var thresholds = ee.List.sequence(0, 1, 0.05);
+
+// Function to evaluate a threshold
+var evalThreshold = function(thresh) {
+  thresh = ee.Number(thresh);
+  
+  // Apply threshold to probability band
+  var classified = probPresenceProp.gt(thresh).rename(species + '_pred');
+  
+  // Sample at testing points (keep prob + prediction)
+  var test = probPresenceProp.addBands(classified).sampleRegions({
+    collection: testingPoints,
+    properties: [species],
+    scale: 30
+  });
+  
+  // Add observed presence (0/1)
+  var testPA = test.map(function(f) {
+    var obs = ee.Number(f.get(species)).gt(0).int();
+    return f.set(species + '_obs', obs);
+  });
+  
+  // Confusion matrix
+  var cm = testPA.errorMatrix(species + '_obs', species + '_pred');
+  
+  return ee.Feature(null, {
+    threshold: thresh,
+    accuracy: cm.accuracy(),
+    kappa: cm.kappa()
+  });
+};
+
+// Apply to all thresholds
+var results = ee.FeatureCollection(thresholds.map(evalThreshold));
+
+// Print all thresholds with metrics
+print('Threshold results', results);
+
+// Find best threshold by accuracy
+var best = results.sort('accuracy', false).first();
+print('Best threshold by accuracy', best);
+
+
+
+/////////////////////////////////////////////////////////////////////////////
 
 
 // -----------------------
