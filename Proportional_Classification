@@ -1,14 +1,12 @@
 // Display AOI
 Map.centerObject(geometry, 11);
-Map.addLayer(newdata)
+Map.addLayer(newdata, {}, 'Point Locations')
 
 // Filter points that fall inside the polygon
 var newdata = newdata.filterBounds(geometry)
 print('Number of points inside polygon:', newdata.size());
 
-newdata = newdata.randomColumn("rand");
-//newdata = newdata.sort("rand").limit(150);
-print(newdata)
+
 
 // -----------------------------------
 //general functions
@@ -65,7 +63,7 @@ var aoi = geometry
 var year = 2023;
 var start = ee.Date.fromYMD(year, 1, 1);
 var end = ee.Date.fromYMD(year, 12, 31);
-var threshold = 0.30;  // EVI threshold for phenology
+var threshold = 0.20;  // EVI threshold for phenology I changed to 0.2 
 
 // -----------------------------------
 // EVI
@@ -139,9 +137,9 @@ var hlsl = ee.ImageCollection('NASA/HLS/HLSL30/v002')
   .map(addEVI)
   .map(tasseledCap)
   //.select("EVI")
-  .map(function(image) {
-    return image.updateMask(forestMask);
-  })
+  // .map(function(image) {
+  //   return image.updateMask(forestMask);
+  // })
   .map(function(img) {
     var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
     return img.set('DOY', doy);
@@ -157,9 +155,9 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
   .map(addEVI)
   .map(tasseledCap)
   //.select("EVI")
-  .map(function(image) {
-    return image.updateMask(forestMask);
-  })
+  // .map(function(image) {
+  //   return image.updateMask(forestMask);
+  // })
   .map(function(img) {
     var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
     return img.set('DOY', doy);
@@ -168,11 +166,11 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
 // Merge and sort
 var hls = hlsl.merge(hlss).sort('system:time_start');
 
-//var hls = tasseledCap(hls);
 
-print("n Images", hls.size())
+//print("n Images", hls.size())
 
 print("HLS Bands", hls.first().bandNames())
+
 
 // -------------------------------
 // Percentiles
@@ -208,7 +206,56 @@ var coeffs = harmonicFit.select('coefficients')
   .arrayProject([0])
   .arrayFlatten([['a', 'b', 'c']]);
 
-print('Harmonic Coefficients:', coeffs);
+//print('Harmonic Coefficients:', coeffs);
+
+// -------------------------------
+//Predict EVI Using Harmonic Model
+// -------------------------------
+function predictEVI(day) {
+  var t = ee.Image.constant(day).float();
+  var sin = t.multiply(omega).sin();
+  var cos = t.multiply(omega).cos();
+
+  var pred = coeffs.select('a')
+    .add(coeffs.select('b').multiply(sin))
+    .add(coeffs.select('c').multiply(cos))
+    .rename('EVI');
+
+  return pred.set('system:time_start', start.advance(day, 'day').millis());
+}
+
+var days = ee.List.sequence(0, 364, 8);  // every 8 days 
+var fittedEVI_HM = ee.ImageCollection.fromImages(days.map(predictEVI))
+.map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1); // 1-based DOY
+    return img.set('DOY', doy);
+  });
+// -------------------------------
+// Fit Harmonic Model    What does this do?
+// -------------------------------
+var omega = 2 * Math.PI / 365.25;
+
+function addTimeBands(image) {
+  var t = ee.Date(image.get('system:time_start')).difference(start, 'day');
+  var time = ee.Image.constant(t).float().rename('t');
+  var sin = time.multiply(omega).sin().rename('sin');
+  var cos = time.multiply(omega).cos().rename('cos');
+  return image.addBands([time, sin, cos]);
+}
+
+var harmonicInputs = hls.map(addTimeBands);
+
+var harmonicFit = harmonicInputs.select(['t', 'sin', 'cos', 'EVI'])
+  .reduce(ee.Reducer.linearRegression({
+    numX: 3,
+    numY: 1
+  }));
+
+var coeffs = harmonicFit.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([['a', 'b', 'c']]);
+
+//print('Harmonic Coefficients:', coeffs);
 
 // -------------------------------
 //Predict EVI Using Harmonic Model
@@ -243,6 +290,8 @@ var fittedWithTime = fittedEVI_HM.map(function(img) {
 });
 
 
+
+
 // Mask where EVI is below threshold
 var aboveThreshold = fittedWithTime.map(function(img) {
   return img.updateMask(img.select('EVI').gt(threshold));
@@ -265,11 +314,14 @@ var los = eos.subtract(sos).rename('LOS');
 
 
 // Add SOS to map with dynamic scaling
-// Map.addLayer(sos, {
-//   min: 100,
-//   max: 200,
-//   palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
-// }, 'Start of Season (DOY)');
+Map.addLayer(sos, {
+  min: 100,
+  max: 200,
+  palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
+}, 'Start of Season (DOY)');
+
+
+
 
 // Map.addLayer(sos, {}, 'SOS')
 // Map.addLayer(eos, {}, 'EOS')
@@ -299,7 +351,9 @@ var rangeEVI = maxEVI.subtract(minEVI).rename('EVI_range');
 seasonMetrics = seasonMetrics
   .addBands(meanEVI)
   .addBands(stdEVI)
-  .addBands(rangeEVI);
+  .addBands(rangeEVI)
+  .addBands(maxEVI)
+  .addBands(minEVI);
   
 // Define the bands you want to compute range for
 var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', "TCB", 'TCG', 'TCW'];
@@ -342,8 +396,8 @@ var withRandom = points.randomColumn('random',42);
 var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
 var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
 
-print('trainingPoints', trainingPoints)
-print('testingPoints', testingPoints)
+// print('trainingPoints', trainingPoints)
+// print('testingPoints', testingPoints)
 
 
 // Add a random value column (between 0 and 1)
@@ -356,8 +410,8 @@ var palette = ['white', 'green'];
 // Dominance Map
 // ---------------------------------------------
 // Define your species list
-var speciesList = ["Aspen", "Maple", "Oak", "Birch", "Hemlock", "Pine", "Cedar"];
-var speciesList = [ "Maple", "Oak"];
+var speciesList = ["Aspen", "Maple", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Ash"];
+//var speciesList = [ "Maple", "Oak"];
 
 // Define color palette
 var palette = ['white', 'green'];
@@ -376,7 +430,7 @@ var training = seasonMetrics.sampleRegions({
   scale: 30
 });
 
-print('training', training)
+//print('training', training)
 
 // Create a binary presence/absence column
 // (assuming species column is proportion between 0–1)
@@ -385,7 +439,7 @@ var trainingPA = training.map(function(f) {
   return f.set('presence', pa);
 });
 
-  //print('TrainingPA', trainingPA)
+  print('TrainingPA', trainingPA)
 
 // -----------------------
 // 2. Stage 1: Classification model (presence/absence)
@@ -412,7 +466,12 @@ var rfClass = ee.Classifier.smileRandomForest(50)
 // Predict probability of oak presence, remove this line when using rf CLASSIFICATION
 var probPresenceProp = seasonMetrics.classify(rfClass).rename(species + '_prop');
 
-var probPresence = probPresenceProp.gt(0.35).rename(species + '_pred');
+var probPresence = probPresenceProp.gt(0.3).rename(species + '_pred');
+
+// Add prediction layer to the map
+Map.addLayer(probPresence, 
+             {min: 0, max: 1, palette: ['white', 'green']}, 
+             species + ' Probability of Presence');
 
 // This is commented out when using the PROBABILITY rf
 /////////////////////////////////////////////////////////////////
@@ -445,8 +504,8 @@ var testPA = test.map(function(f) {
 });
 ////////////////////////////////////////////////////////////////////
 
-print("Test", test)
-print("TestPA", testPA)
+//print("Test", test)
+//print("TestPA", testPA)
 
 
 //Build confusion matrix
@@ -457,55 +516,84 @@ print('Kappa ' +species, confusionMatrix.kappa());
 print('Producers Accuracy ' +species, confusionMatrix.producersAccuracy());
 print('Users Accuracy ' +species, confusionMatrix.consumersAccuracy());
 
+// Build confusion matrix
+var confusionMatrix = testPA.errorMatrix(species + '_obs', species + '_pred');
+
+// Wrap metrics into a Feature
+var metrics = ee.Feature(null, {
+  species: species,
+  overall_accuracy: confusionMatrix.accuracy(),
+  kappa: confusionMatrix.kappa(),
+  //producers_accuracy: confusionMatrix.producersAccuracy().toDictionary(),
+  //users_accuracy: confusionMatrix.consumersAccuracy().toDictionary(),
+  matrix: confusionMatrix.array()  // confusion matrix as array
+});
+
+// Make it a FeatureCollection
+var metricsFC = ee.FeatureCollection([metrics]);
+
+// Export to Drive
+Export.table.toDrive({
+  collection: metricsFC,
+  description: 'ConfusionMatrix_' + species,
+  folder: 'BBOW/EE',
+  fileNamePrefix: 'confusionMatrix_' + species,
+  fileFormat: 'CSV'
+});
+
 //////////////////////////////////////////////////////////////////////////////
 // Test for th eoptimal classifcation threshold
 /////////////////////////////////////////////////////////////////////////////
 
 
-// Thresholds to test (step size 0.05, adjust if you want finer resolution)
-var thresholds = ee.List.sequence(0, 1, 0.05);
+// // Thresholds to test (step size 0.05, adjust if you want finer resolution)
+// var thresholds = ee.List.sequence(0, 1, 0.05);
 
-// Function to evaluate a threshold
-var evalThreshold = function(thresh) {
-  thresh = ee.Number(thresh);
+// // Function to evaluate a threshold
+// var evalThreshold = function(thresh) {
+//   thresh = ee.Number(thresh);
   
-  // Apply threshold to probability band
-  var classified = probPresenceProp.gt(thresh).rename(species + '_pred');
+//   // Apply threshold to probability band
+//   var classified = probPresenceProp.gt(thresh).rename(species + '_pred');
   
-  // Sample at testing points (keep prob + prediction)
-  var test = probPresenceProp.addBands(classified).sampleRegions({
-    collection: testingPoints,
-    properties: [species],
-    scale: 30
-  });
+//   // Sample at testing points (keep prob + prediction)
+//   var test = probPresenceProp.addBands(classified).sampleRegions({
+//     collection: testingPoints,
+//     properties: [species],
+//     scale: 30
+//   });
   
-  // Add observed presence (0/1)
-  var testPA = test.map(function(f) {
-    var obs = ee.Number(f.get(species)).gt(0).int();
-    return f.set(species + '_obs', obs);
-  });
+//   // Add observed presence (0/1)
+//   var testPA = test.map(function(f) {
+//     var obs = ee.Number(f.get(species)).gt(0).int();
+//     return f.set(species + '_obs', obs);
+//   });
   
-  // Confusion matrix
-  var cm = testPA.errorMatrix(species + '_obs', species + '_pred');
+//   // Confusion matrix
+//   var cm = testPA.errorMatrix(species + '_obs', species + '_pred');
   
-  return ee.Feature(null, {
-    threshold: thresh,
-    accuracy: cm.accuracy(),
-    kappa: cm.kappa()
-  });
-};
+//   return ee.Feature(null, {
+//     threshold: thresh,
+//     accuracy: cm.accuracy(),
+//     kappa: cm.kappa()
+//   });
+// };
 
-// Apply to all thresholds
-var results = ee.FeatureCollection(thresholds.map(evalThreshold));
+// // Apply to all thresholds
+// var results = ee.FeatureCollection(thresholds.map(evalThreshold));
 
-// Print all thresholds with metrics
-print('Threshold results', results);
+// // Print all thresholds with metrics
+// //print('Threshold results', results);
 
-// Find best threshold by accuracy
-var best = results.sort('accuracy', false).first();
-print('Best threshold by accuracy', best);
+// // Find best threshold by accuracy
+// var best = results.sort('accuracy', false).first();
+// //print('Best threshold by accuracy', best);
 
+// // Get the best threshold as a number
+// var bestThreshold = ee.Number(best.get('threshold'));
 
+// // Apply that threshold to classify presence
+// var probPresence = probPresenceProp.gt(bestThreshold).rename(species + '_pred');
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -513,7 +601,26 @@ print('Best threshold by accuracy', best);
 // -----------------------
 // 3. Stage 2: Regression model (only where proportion > 0)
 // -----------------------
-var trainingPositive = training.filter(ee.Filter.gt(species, 0));
+print("Training "+species, training)
+print("Prob presence "+ species, probPresence)
+
+var present = seasonMetrics.addBands(probPresence).sampleRegions({
+  collection: trainingPoints,
+  //reducer: ee.Reducer.first(),
+  properties: [species],
+  scale:  30
+});
+
+print("new present "+ species, present)
+
+var presentOnes = present.filter(ee.Filter.eq(species +"_pred", 1));
+
+// Inspect
+print('Filtered present', presentOnes);
+
+//var trainingPositive = training.filter(ee.Filter.gt(species, 0));
+
+var trainingPositive = presentOnes
 
 var rfReg = ee.Classifier.smileRandomForest(500)
   .setOutputMode('REGRESSION')
@@ -536,6 +643,17 @@ var prediction = finalPrediction;
 
   // Visualize
   Map.addLayer(prediction, {min: 0, max: 1, palette: palette}, 'Predicted ' + species);
+  
+  // Export binary presence/absence raster (0/1)
+Export.image.toDrive({
+  image: probPresence,
+  description: species + '_presenceAbsence',
+  folder: 'BBOW/EE',
+  fileNamePrefix: species + '_presenceAbsence',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
 
   // Variable importance
   var importance = ee.Dictionary(rfReg.explain().get('importance'));
@@ -548,16 +666,16 @@ var prediction = finalPrediction;
     scale: 30
   });
 
-  // var predictedTest = testing.classify(rf);
-  // var withError = predictedTest.map(function(f) {
-  //   var observed = ee.Number(f.get(species));
-  //   var pred = ee.Number(f.get('classification'));
-  //   var squaredError = observed.subtract(pred).pow(2);
-  //   return f.set('squaredError', squaredError);
-  // });
+  var predictedTest = testing.classify(rfReg);
+  var withError = predictedTest.map(function(f) {
+    var observed = ee.Number(f.get(species));
+    var pred = ee.Number(f.get('classification'));
+    var squaredError = observed.subtract(pred).pow(2);
+    return f.set('squaredError', squaredError);
+  });
 
-  // var mse = withError.aggregate_mean('squaredError');
-  // print('MSE for ' + species + ':', mse);
+  var mse = withError.aggregate_mean('squaredError');
+  print('MSE for ' + species + ':', mse);
   
   
   // R squared testing
@@ -567,7 +685,7 @@ var prediction = finalPrediction;
     scale: 30
   });
 
-print(test)
+//print(test)
 
 var chart = ui.Chart.feature.byFeature({
   features: test,
@@ -583,8 +701,19 @@ var chart = ui.Chart.feature.byFeature({
   trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
 });  
  
- print(chart)
+// Export scatterplot data (Observed vs Predicted)
+Export.table.toDrive({
+  collection: test,
+  description: 'ObsVsPred_' + species,
+  folder: 'BBOW/EE',
+  fileNamePrefix: 'ObsVsPred_' + species,
+  fileFormat: 'CSV'
+});
+
  
+print(chart)
+
+
 });
 
 
