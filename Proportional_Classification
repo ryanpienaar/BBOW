@@ -1,6 +1,19 @@
+
+var geometry = ee.Geometry.Polygon(
+  [[
+    [-91.1464652714206, 46.692168586612084],
+    [-90.38016888470185, 46.692168586612084],
+    [-90.38016888470185, 47.09195527262986],
+    [-91.1464652714206, 47.09195527262986],
+    [-91.1464652714206, 46.692168586612084]
+  ]],
+  null,  // proj (null means default WGS84)
+  false  // geodesic
+);
+
 // Display AOI
 Map.centerObject(geometry, 11);
-Map.addLayer(newdata, {}, 'Point Locations')
+//Map.addLayer(newdata, {}, 'Point Locations')
 
 // Filter points that fall inside the polygon
 var newdata = newdata.filterBounds(geometry)
@@ -60,7 +73,7 @@ var forestMask = nlcd.remap(forestClasses, [1, 1, 1], 0); // 1 = forest, 0 = non
 // phenology threshold
 // -----------------------------------
 var aoi = geometry
-var year = 2023;
+var year = 2020;
 var start = ee.Date.fromYMD(year, 1, 1);
 var end = ee.Date.fromYMD(year, 12, 31);
 var threshold = 0.20;  // EVI threshold for phenology I changed to 0.2 
@@ -167,7 +180,7 @@ var hlss = ee.ImageCollection('NASA/HLS/HLSS30/v002')
 var hls = hlsl.merge(hlss).sort('system:time_start');
 
 
-//print("n Images", hls.size())
+print("n Images", hls.size())
 
 print("HLS Bands", hls.first().bandNames())
 
@@ -314,11 +327,11 @@ var los = eos.subtract(sos).rename('LOS');
 
 
 // Add SOS to map with dynamic scaling
-Map.addLayer(sos, {
-  min: 100,
-  max: 200,
-  palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
-}, 'Start of Season (DOY)');
+// Map.addLayer(sos, {
+//   min: 100,
+//   max: 200,
+//   palette: ['purple', 'blue', 'green', 'yellow', 'orange', 'red']
+// }, 'Start of Season (DOY)');
 
 
 
@@ -382,10 +395,7 @@ print('Bands:', seasonMetrics.bandNames());
 
 ///////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////
+
 
 var points = newdata
 
@@ -400,9 +410,6 @@ var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
 // print('testingPoints', testingPoints)
 
 
-// Add a random value column (between 0 and 1)
-// Add a random column with a fixed seed
-
 // Define color palette
 var palette = ['white', 'green'];
 
@@ -411,7 +418,7 @@ var palette = ['white', 'green'];
 // ---------------------------------------------
 // Define your species list
 var speciesList = ["Aspen", "Maple", "Oak", "Birch", "Hemlock", "Pine", "Cedar", "Ash"];
-//var speciesList = [ "Maple", "Oak"];
+var speciesList = [ "Maple", "Oak"];
 
 // Define color palette
 var palette = ['white', 'green'];
@@ -444,16 +451,7 @@ var trainingPA = training.map(function(f) {
 // -----------------------
 // 2. Stage 1: Classification model (presence/absence)
 // -----------------------
-// var rfClass = ee.Classifier.smileRandomForest(500)
-//   .setOutputMode('CLASSIFICATION')  // now works, since 'presence' is 0/1
-//   .train({
-//     features: trainingPA,
-//     classProperty: 'presence',
-//     inputProperties: seasonMetrics.bandNames()
-//   });
 
-// // Predict probability of oak presence
-// var probPresence = seasonMetrics.classify(rfClass).rename(species + '_pred');
 
 var rfClass = ee.Classifier.smileRandomForest(50)
   .setOutputMode('PROBABILITY')  
@@ -466,28 +464,15 @@ var rfClass = ee.Classifier.smileRandomForest(50)
 // Predict probability of oak presence, remove this line when using rf CLASSIFICATION
 var probPresenceProp = seasonMetrics.classify(rfClass).rename(species + '_prop');
 
-var probPresence = probPresenceProp.gt(0.3).rename(species + '_pred');
+var probPresence = probPresenceProp.gt(0.35).rename(species + '_pred');
 
 // Add prediction layer to the map
 Map.addLayer(probPresence, 
-             {min: 0, max: 1, palette: ['white', 'green']}, 
-             species + ' Probability of Presence');
+            {min: 0, max: 1, palette: ['white', 'green']}, 
+            species + ' Probability of Presence');
 
-// This is commented out when using the PROBABILITY rf
-/////////////////////////////////////////////////////////////////
-// var test = probPresence.sampleRegions({
-//     collection: testingPoints,
-//     properties: [species],
-//     scale: 30
-//   });
-  
-// var testPA = test.map(function(f) {
-//   var obs = ee.Number(f.get(species)).gt(0).int();  // 0 or 1
-//   return f.set(species +'_obs', obs);
-// });
-////////////////////////////////////////////////////////////////
 
-// This is commented out when using the CLASSIFICATION rf
+
 /////////////////////////////////////////////////////////////////////
 
 // Sample BOTH probability and thresholded prediction
@@ -541,62 +526,6 @@ Export.table.toDrive({
   fileFormat: 'CSV'
 });
 
-//////////////////////////////////////////////////////////////////////////////
-// Test for th eoptimal classifcation threshold
-/////////////////////////////////////////////////////////////////////////////
-
-
-// // Thresholds to test (step size 0.05, adjust if you want finer resolution)
-// var thresholds = ee.List.sequence(0, 1, 0.05);
-
-// // Function to evaluate a threshold
-// var evalThreshold = function(thresh) {
-//   thresh = ee.Number(thresh);
-  
-//   // Apply threshold to probability band
-//   var classified = probPresenceProp.gt(thresh).rename(species + '_pred');
-  
-//   // Sample at testing points (keep prob + prediction)
-//   var test = probPresenceProp.addBands(classified).sampleRegions({
-//     collection: testingPoints,
-//     properties: [species],
-//     scale: 30
-//   });
-  
-//   // Add observed presence (0/1)
-//   var testPA = test.map(function(f) {
-//     var obs = ee.Number(f.get(species)).gt(0).int();
-//     return f.set(species + '_obs', obs);
-//   });
-  
-//   // Confusion matrix
-//   var cm = testPA.errorMatrix(species + '_obs', species + '_pred');
-  
-//   return ee.Feature(null, {
-//     threshold: thresh,
-//     accuracy: cm.accuracy(),
-//     kappa: cm.kappa()
-//   });
-// };
-
-// // Apply to all thresholds
-// var results = ee.FeatureCollection(thresholds.map(evalThreshold));
-
-// // Print all thresholds with metrics
-// //print('Threshold results', results);
-
-// // Find best threshold by accuracy
-// var best = results.sort('accuracy', false).first();
-// //print('Best threshold by accuracy', best);
-
-// // Get the best threshold as a number
-// var bestThreshold = ee.Number(best.get('threshold'));
-
-// // Apply that threshold to classify presence
-// var probPresence = probPresenceProp.gt(bestThreshold).rename(species + '_pred');
-
-/////////////////////////////////////////////////////////////////////////////
-
 
 // -----------------------
 // 3. Stage 2: Regression model (only where proportion > 0)
@@ -622,7 +551,7 @@ print('Filtered present', presentOnes);
 
 var trainingPositive = presentOnes
 
-var rfReg = ee.Classifier.smileRandomForest(500)
+var rfReg = ee.Classifier.smileRandomForest(1000)
   .setOutputMode('REGRESSION')
   .train({
     features: trainingPositive,
@@ -643,6 +572,57 @@ var prediction = finalPrediction;
 
   // Visualize
   Map.addLayer(prediction, {min: 0, max: 1, palette: palette}, 'Predicted ' + species);
+  
+  ///////////////////////////////////////////////////////////////
+//////////////// Add a legend/////////////////////////////////
+
+var min = 0;
+var max = 1;
+
+// Create a panel for the legend
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+// Add a title
+var legendTitle = ui.Label({
+  value: 'Predicted ' + species,
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0', padding: '0'}
+});
+legend.add(legendTitle);
+
+// Create the colorbar using a thumbnail
+var lon = ee.Image.pixelLonLat().select('longitude');
+var gradient = lon.multiply((max - min) / 100.0).add(min);
+
+var legendImage = gradient.visualize({min: min, max: max, palette: palette});
+var thumbnail = ui.Thumbnail({
+  image: legendImage,
+  params: {bbox:'0,0,100,10', dimensions:'100x10'},
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'}
+});
+
+// Add colorbar to panel
+legend.add(thumbnail);
+
+// Add min & max labels
+var labels = ui.Panel({
+  widgets: [
+    ui.Label(min, {margin: '4px 8px'}),
+    ui.Label(max, {margin: '4px 8px', textAlign: 'right', stretch: 'horizontal'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+legend.add(labels);
+
+// Add legend to the map
+Map.add(legend);
+
+//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
   
   // Export binary presence/absence raster (0/1)
 Export.image.toDrive({
@@ -675,7 +655,9 @@ Export.image.toDrive({
   });
 
   var mse = withError.aggregate_mean('squaredError');
-  print('MSE for ' + species + ':', mse);
+  //print('MSE for ' + species + ':', mse);
+  var rmse = ee.Number(mse).sqrt();
+ print('RMSE for ' + species + ':', rmse);
   
   
   // R squared testing
@@ -718,36 +700,5 @@ print(chart)
 
 
 
-// // Create scatterplot of Oak vs classification
-// var chart = ui.Chart.feature.byFeature({
-//   features: testing,
-//   xProperty: 'Oak',
-//   yProperties: ['classification']
-// })
-// .setChartType('ScatterChart')
-// .setOptions({
-//   title: 'Observed vs Predicted',
-//   hAxis: {title: 'Observed Oak proportion'},
-//   vAxis: {title: 'Predicted classification'},
-//   pointSize: 4,
-//   trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
-// });
-
-// // Print the chart
-// print(chart);
-
-
   
   
-//////////////////////////////////////////////////
-/////////////////////////////////////////////////
-////////////////////////////////////////////////
-
-
-// Export.image.toDrive({image: prediction,
-// description: "Oak prediction raster export",
-// folder: "BBOW/EE", 
-// scale: 30,
-// fileDimensions: 5000,
-// fileFormat: "GeoTIFF"
-// })
