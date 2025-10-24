@@ -4,7 +4,7 @@
 
 // Display AOI
 Map.centerObject(geometry, 11);
-Map.addLayer(newdata, {}, 'Point Locations')
+//Map.addLayer(newdata, {}, 'Point Locations')
 
 // Filter points that fall inside the polygon
 var newdata = newdata.filterBounds(geometry)
@@ -294,6 +294,8 @@ var fittedWithTime = fittedEVI_HM.map(function(img) {
 });
 
 
+
+
 // Mask where EVI is below threshold
 var aboveThreshold = fittedWithTime.map(function(img) {
   return img.updateMask(img.select('EVI').gt(threshold));
@@ -380,7 +382,7 @@ seasonMetrics = seasonMetrics.addBands(summaryBands);
 //seasonMetrics = seasonMetrics.select("EVI_mean", "SOS", "EOS", "PeakEVI", "POS", "LOS")
   
 print('Bands:', seasonMetrics.bandNames());
-Map.addLayer(seasonMetrics, {}, "seasonMetrics")
+//Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 
 ///////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
@@ -480,759 +482,134 @@ print('trainingPoints', trainingPoints)
 print('testingPoints', testingPoints)
 
 
-// ----------------------
-// RF accuracy vs nTrees
-// ----------------------
-
-// --------------------------------------
-// Step 0: Create testingPoints proportional to class area (based on point counts)
-// --------------------------------------
-
-// Count number of points per class in the training data (returns a server-side Dictionary)
-var classCounts = trainingPoints.aggregate_histogram(species + ' Obs_Presence');
-
-// Keys are class labels (as strings)
-var classList = classCounts.keys(); // ee.List
-
-// Total number of test points you want overall
-var totalTestPoints = 200; // adjust as needed
-
-// Total count (sum of all class counts)
-var totalCount = ee.Number(classCounts.values().reduce(ee.Reducer.sum()));
-
-// Map over classes to create per-class test subsets
-var testingSamplesList = classList.map(function(c) {
-  // c is a string, convert to number if necessary
-  var classValue = ee.Number.parse(c);
-  var count = ee.Number(classCounts.get(c)); // count of points for this class
-
-  // proportion of this class in the points
-  var proportion = count.divide(totalCount);
-
-  // number of test points for this class (rounded)
-  var n = proportion.multiply(totalTestPoints).round();
-
-  // optionally ensure at least 1 sample for classes that exist:
-  // var n = proportion.multiply(totalTestPoints).round().max(1);
-
-  // Subset points of that class
-  var classSubset = trainingPoints.filter(ee.Filter.eq(species + ' Obs_Presence', classValue));
-
-  // Add a random column and pick n points
-  var sampleSubset = classSubset.randomColumn('rand').sort('rand').limit(n);
-
-  return sampleSubset;
-});
-
-// Merge the list of per-class FeatureCollections into a single FC
-var testingPoints = ee.FeatureCollection(testingSamplesList).flatten();
-
-// Now remove testing points from the original trainingPoints.
-// We invert an inList filter by calling .not() on it:
-var testIDs = testingPoints.aggregate_array('system:index'); // server-side list of indices
-var trainingPointsNew = trainingPoints.filter(
-  ee.Filter.inList('system:index', testIDs).not()
-);
-
-// Reassign variables (optional)
-testingPoints = ee.FeatureCollection(testingPoints);
-trainingPoints = ee.FeatureCollection(trainingPointsNew);
-
-// Quick prints for sanity-checking
-print('Total test points requested:', totalTestPoints);
-print('Actual testingPoints count:', testingPoints.size());
-print('Remaining trainingPoints count:', trainingPoints.size());
-
-
-// Replace your old testingPoints and trainingPoints
-
-
-// -------------------------------
-// Step 1: Tune numberOfTrees
-// -------------------------------
-var nTreeList = ee.List.sequence(50, 2000, 50);
-
-var resultsTrees = nTreeList.map(function(nt) {
-  nt = ee.Number(nt);
-  
-  var rfClass = ee.Classifier.smileRandomForest({
-    numberOfTrees: nt,
-    variablesPerSplit: 10, // fixed for now
-    minLeafPopulation: 3,
-    bagFraction: 0.6
-  })
-  .setOutputMode('PROBABILITY')
-  .train({
-    features: trainingPoints,
-    classProperty: species + ' Obs_Presence',
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-  var probPresence = seasonMetrics.classify(rfClass).rename(species + '_prop_prediction');
-  var binaryPred = probPresence.gt(0.7).rename(species + '_binary_prediction');
-
-  var test = binaryPred.sampleRegions({
-    collection: testingPoints,
-    properties: [species + ' Obs_Presence'],
-    scale: 30,
-    geometries: true
-  });
-
-  var confusion = test.errorMatrix(species + ' Obs_Presence', species + '_binary_prediction');
-  var acc = confusion.accuracy();
-  var kappa = confusion.kappa();
-
-  return ee.Feature(null, {nTrees: nt, Accuracy: acc, Kappa: kappa});
-});
-
-var resultsTreesFC = ee.FeatureCollection(resultsTrees);
-print('Tuning nTrees results:', resultsTreesFC);
-
-// Plot accuracy & kappa vs number of trees
-var chartTrees = ui.Chart.feature.byFeature({
-  features: resultsTreesFC,
-  xProperty: 'nTrees',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Number of Trees',
-  hAxis: {title: 'Number of Trees'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['blue', 'red']
-});
-print(chartTrees);
-
-// Extract best number of trees based on highest accuracy
-var bestTrees = resultsTreesFC.sort('Accuracy', false).first().get('nTrees');
-print('Best number of trees:', bestTrees);
-
-// -----------------------------------
-// Step 2: Tune variablesPerSplit
-// -----------------------------------
-var varsList = ee.List.sequence(1, 20, 1);
-
-var resultsVars = varsList.map(function(vs) {
-  vs = ee.Number(vs);
-  
-  var rfClass = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestTrees,
-    variablesPerSplit: vs,
-    minLeafPopulation: 3,
-    bagFraction: 0.6
-  })
-  .setOutputMode('PROBABILITY')
-  .train({
-    features: trainingPoints,
-    classProperty: species + ' Obs_Presence',
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-  var probPresence = seasonMetrics.classify(rfClass).rename(species + '_prop_prediction');
-  var binaryPred = probPresence.gt(0.7).rename(species + '_binary_prediction');
-
-  var test = binaryPred.sampleRegions({
-    collection: testingPoints,
-    properties: [species + ' Obs_Presence'],
-    scale: 30,
-    geometries: true
-  });
-
-  var confusion = test.errorMatrix(species + ' Obs_Presence', species + '_binary_prediction');
-  var acc = confusion.accuracy();
-  var kappa = confusion.kappa();
-
-  return ee.Feature(null, {variablesPerSplit: vs, Accuracy: acc, Kappa: kappa});
-});
-
-var resultsVarsFC = ee.FeatureCollection(resultsVars);
-print('Tuning variablesPerSplit results:', resultsVarsFC);
-
-// Plot accuracy & kappa vs variablesPerSplit
-var chartVars = ui.Chart.feature.byFeature({
-  features: resultsVarsFC,
-  xProperty: 'variablesPerSplit',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Variables per Split',
-  hAxis: {title: 'Variables per Split'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['green', 'orange']
-});
-print(chartVars);
-
-// Get best variablesPerSplit
-var bestVars = resultsVarsFC.sort('Accuracy', false).first().get('variablesPerSplit');
-print('Best variablesPerSplit:', bestVars);
-
-// --------------------------------------
-// Step 3: Tune minLeafPopulation
-// --------------------------------------
-var minLeafList = ee.List.sequence(1, 10, 1);
-
-var resultsLeaf = minLeafList.map(function(ml) {
-  ml = ee.Number(ml);
-  
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestTrees,
-    variablesPerSplit: bestVars,
-    minLeafPopulation: ml,
-    bagFraction: 0.6
-  })
-  .setOutputMode('PROBABILITY')
-  .train({
-    features: trainingPoints,
-    classProperty: species + ' Obs_Presence',
-    inputProperties: seasonMetrics.bandNames()
-  });
-  
-  var binaryPred = seasonMetrics.classify(rf)
-    .gt(0.7)
-    .rename(species + '_binary_prediction');
-  
-  var test = binaryPred.sampleRegions({
-    collection: testingPoints,
-    properties: [species + ' Obs_Presence'],
-    scale: 30
-  });
-  
-  var confusion = test.errorMatrix(species + ' Obs_Presence', species + '_binary_prediction');
-  return ee.Feature(null, {
-    minLeafPopulation: ml,
-    Accuracy: confusion.accuracy(),
-    Kappa: confusion.kappa()
-  });
-});
-
-var resultsLeafFC = ee.FeatureCollection(resultsLeaf);
-print('Tuning minLeafPopulation results:', resultsLeafFC);
-
-var chartLeaf = ui.Chart.feature.byFeature({
-  features: resultsLeafFC,
-  xProperty: 'minLeafPopulation',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Min Leaf Population',
-  hAxis: {title: 'Min Leaf Population'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['purple', 'red']
-});
-print(chartLeaf);
-
-var bestLeaf = resultsLeafFC.sort('Accuracy', false).first().get('minLeafPopulation');
-print('Best minLeafPopulation:', bestLeaf);
-
-// --------------------------------------
-// Step 4: Tune bagFraction
-// --------------------------------------
-var bagList = ee.List.sequence(0.3, 1.0, 0.1); // 0.3 → 1.0 by 0.1
-
-var resultsBag = bagList.map(function(bf) {
-  bf = ee.Number(bf);
-  
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestTrees,
-    variablesPerSplit: bestVars,
-    minLeafPopulation: bestLeaf,
-    bagFraction: bf
-  })
-  .setOutputMode('PROBABILITY')
-  .train({
-    features: trainingPoints,
-    classProperty: species + ' Obs_Presence',
-    inputProperties: seasonMetrics.bandNames()
-  });
-  
-  var binaryPred = seasonMetrics.classify(rf)
-    .gt(0.7)
-    .rename(species + '_binary_prediction');
-  
-  var test = binaryPred.sampleRegions({
-    collection: testingPoints,
-    properties: [species + ' Obs_Presence'],
-    scale: 30
-  });
-  
-  var confusion = test.errorMatrix(species + ' Obs_Presence', species + '_binary_prediction');
-  return ee.Feature(null, {
-    bagFraction: bf,
-    Accuracy: confusion.accuracy(),
-    Kappa: confusion.kappa()
-  });
-});
-
-var resultsBagFC = ee.FeatureCollection(resultsBag);
-print('Tuning bagFraction results:', resultsBagFC);
-
-var chartBag = ui.Chart.feature.byFeature({
-  features: resultsBagFC,
-  xProperty: 'bagFraction',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Bag Fraction',
-  hAxis: {title: 'Bag Fraction'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['teal', 'red']
-});
-print(chartBag);
-
-var bestBag = resultsBagFC.sort('Accuracy', false).first().get('bagFraction');
-print('Best bagFraction:', bestBag);
-
-// --------------------------------------
-// Step 6: Tune probability threshold
-// --------------------------------------
-var thresholdList = ee.List.sequence(0.1, 1.0, 0.1);
-
-// Pre-train the model once with the best parameters
-var tunedRF = ee.Classifier.smileRandomForest({
-  numberOfTrees: bestTrees,
-  variablesPerSplit: bestVars,
-  minLeafPopulation: bestLeaf,
-  bagFraction: bestBag
+var rfClass = ee.Classifier.smileRandomForest({
+  numberOfTrees: 50,
+  variablesPerSplit: 10,
+  minLeafPopulation: 3,
+  bagFraction: 0.6
 })
-.setOutputMode('PROBABILITY')
-.train({
-  features: trainingPoints,
-  classProperty: species + ' Obs_Presence',
-  inputProperties: seasonMetrics.bandNames()
-});
-
-// Predict probabilities once
-var probImage = seasonMetrics.classify(tunedRF).rename(species + '_prob_final');
-
-// Evaluate at different thresholds
-var resultsThresh = thresholdList.map(function(th) {
-  th = ee.Number(th);
-  
-  var binaryPred = probImage.gt(th).rename(species + '_binary_prediction');
-  
-  var test = binaryPred.sampleRegions({
-    collection: testingPoints,
-    properties: [species + ' Obs_Presence'],
-    scale: 30
+  .setOutputMode('PROBABILITY')  
+  .train({
+    features: trainingPoints,
+    classProperty: species + ' Obs_Presence',
+    inputProperties: seasonMetrics.bandNames()
   });
-  
-  var confusion = test.errorMatrix(species + ' Obs_Presence', species + '_binary_prediction');
-  var acc = confusion.accuracy();
-  var kappa = confusion.kappa();
-  
-  return ee.Feature(null, {
-    Threshold: th,
-    Accuracy: acc,
-    Kappa: kappa
-  });
-});
 
-var resultsThreshFC = ee.FeatureCollection(resultsThresh);
-print('Tuning probability threshold results:', resultsThreshFC);
+// Predict probability of oak presence, remove this line when using rf CLASSIFICATION
+var probPresenceProp = seasonMetrics.classify(rfClass).rename(species + '_prop_prediction');
 
-// Plot Accuracy & Kappa vs Threshold
-var chartThresh = ui.Chart.feature.byFeature({
-  features: resultsThreshFC,
-  xProperty: 'Threshold',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'Model Performance vs Probability Threshold',
-  hAxis: {title: 'Threshold'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['blue', 'red']
-});
-print(chartThresh);
+var probPresence = probPresenceProp.gt(0.7).rename(species + '_binary_prediction');
 
-// Get best threshold based on Accuracy
-var bestThresh = resultsThreshFC.sort('Accuracy', false).first().get('Threshold');
-print('Best Threshold:', bestThresh);
+// Add prediction layer to the map
+Map.addLayer(probPresence, 
+            {min: 0, max: 1, palette: ['white', 'green']}, 
+            species + ' Probability of Presence');
 
-// --------------------------------------
-// Step 7: Apply final model and threshold
-// --------------------------------------
-var finalBinary = probImage.gt(0.7).rename(species + '_binary_final');
 
-var testFinal = finalBinary.sampleRegions({
+Map.addLayer(trainingPoints)
+// Sample BOTH probability and thresholded prediction
+var test = probPresence.sampleRegions({
   collection: testingPoints,
-  properties: [species + ' Obs_Presence'],
+  geometries: true,
   scale: 30
 });
 
-var finalConf = testFinal.errorMatrix(species + ' Obs_Presence', species + '_binary_final');
-print('=== FINAL OPTIMIZED MODEL RESULTS ===');
-print('Confusion Matrix:', finalConf);
-print('Overall Accuracy:', finalConf.accuracy());
-print('Kappa:', finalConf.kappa());
-print('Producers Accuracy:', finalConf.producersAccuracy());
-print('Users Accuracy:', finalConf.consumersAccuracy());
 
-// Add map layer
-Map.addLayer(finalBinary,
-  {min: 0, max: 1, palette: ['white', 'green']},
-  species + ' Final Optimized Prediction');
 
-// // -----------------------
-// // 3. Stage 2: Regression model (only where proportion > 0)
-// // -----------------------
+var obsProp = species + ' Obs_Presence';  // observed presence (from test set)
+var predProp = species + '_binary_prediction';         // predicted presence (from classifier output)
 
-// // 1️⃣ Sample the probability raster at training points
-var trainingWithPred = finalBinary.addBands(seasonMetrics).sampleRegions({
+// Compute confusion matrix
+var confusionMatrix = test.errorMatrix(obsProp, predProp);
+
+// Print full summary
+print('=== Accuracy Results for ' + species + ' ===');
+print('Confusion Matrix:', confusionMatrix);
+print('Overall Accuracy:', confusionMatrix.accuracy());
+print('Kappa:', confusionMatrix.kappa());
+print('Producers Accuracy:', confusionMatrix.producersAccuracy());
+print('Users Accuracy:', confusionMatrix.consumersAccuracy());
+
+
+
+// -----------------------
+// 3. Stage 2: Regression model (only where proportion > 0)
+// -----------------------
+
+// 1️⃣ Sample the probability raster at training points
+var trainingWithPred = probPresence.addBands(seasonMetrics).sampleRegions({
   collection: trainingPoints,
   scale: 30,
   geometries: true
 });
 
-//print(trainingWithPred)
-
-// // 2️⃣ Filter to where oak presence was predicted (binary = 1)
+// 2️⃣ Filter to where oak presence was predicted (binary = 1)
 var regPoints = trainingWithPred.filter(
-  ee.Filter.eq(species + '_binary_final', 1)
+  ee.Filter.eq(species + '_binary_prediction', 1)
 );
 
-//print(regPoints)
-
-
-
-// --------------------------------------
-// Step 1: Tune numberOfTrees
-// --------------------------------------
-var nTreeList = ee.List.sequence(50, 2000, 50);
-
-var resultsRegTrees = nTreeList.map(function(nt) {
-  nt = ee.Number(nt);
-
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: nt,
-    variablesPerSplit: 5,
-    minLeafPopulation: 1,
-    bagFraction: 0.9
-  })
-  .setOutputMode('REGRESSION')
-  .train({
-    features: regPoints,
-    classProperty: species,
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
-  
-  
-  var testingWithPred = finalBinary.addBands(pred).sampleRegions({
-  collection: testingPoints,
-  scale: 30,
-  geometries: true
-});
-
-
-var testWithPred = testingWithPred.filter(
-  ee.Filter.eq(species + '_binary_final', 1))
-  
-  
-  
-  var testSample = pred.sampleRegions({
-    collection: testWithPred,
-    properties: [species],
-    scale: 30
-  });
-
-  var testEval = testSample.map(function(f) {
-    var obs = ee.Number(f.get(species));
-    var p = ee.Number(f.get('Oak_density_pred'));
-    var diff = obs.subtract(p);
-    return f.set('squared_error', diff.pow(2));
-  });
-
-  var mse = testEval.aggregate_mean('squared_error');
-  var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-  return ee.Feature(null, {nTrees: nt, RMSE: rmse});
-});
-
-var resultsRegTreesFC = ee.FeatureCollection(resultsRegTrees);
-print('Regression tuning: nTrees', resultsRegTreesFC);
-
-var chartRegTrees = ui.Chart.feature.byFeature({
-  features: resultsRegTreesFC,
-  xProperty: 'nTrees',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Number of Trees',
-  hAxis: {title: 'Number of Trees'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['blue']
-});
-print(chartRegTrees);
-
-var bestRegTrees = resultsRegTreesFC.sort('RMSE').first().get('nTrees');
-print('Best nTrees (Regression):', bestRegTrees);
-
-
-
-// --------------------------------------
-// Step 2: Tune variablesPerSplit
-// --------------------------------------
-var varSplitList = ee.List.sequence(1, 15, 1);  // adjust range if needed
-
-var resultsRegVars = varSplitList.map(function(vs) {
-  vs = ee.Number(vs);
-
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestRegTrees,
-    variablesPerSplit: vs,
-    minLeafPopulation: 1,
-    bagFraction: 0.9
-  })
-  .setOutputMode('REGRESSION')
-  .train({
-    features: regPoints,
-    classProperty: species,
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
-
-  var testingWithPred = finalBinary.addBands(pred).sampleRegions({
-    collection: testingPoints,
-    scale: 30,
-    geometries: true
-  });
-
-  var testWithPred = testingWithPred.filter(
-    ee.Filter.eq(species + '_binary_final', 1)
-  );
-
-  var testSample = pred.sampleRegions({
-    collection: testWithPred,
-    properties: [species],
-    scale: 30
-  });
-
-  var testEval = testSample.map(function(f) {
-    var obs = ee.Number(f.get(species));
-    var p = ee.Number(f.get('Oak_density_pred'));
-    var diff = obs.subtract(p);
-    return f.set('squared_error', diff.pow(2));
-  });
-
-  var mse = testEval.aggregate_mean('squared_error');
-  var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-
-  return ee.Feature(null, {
-    variablesPerSplit: vs,
-    RMSE: rmse
-  });
-});
-
-var resultsRegVarsFC = ee.FeatureCollection(resultsRegVars);
-print('Regression tuning: variablesPerSplit', resultsRegVarsFC);
-
-var chartRegVars = ui.Chart.feature.byFeature({
-  features: resultsRegVarsFC,
-  xProperty: 'variablesPerSplit',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Variables per Split',
-  hAxis: {title: 'Variables per Split'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['red']
-});
-print(chartRegVars);
-
-var bestRegVars = resultsRegVarsFC.sort('RMSE').first().get('variablesPerSplit');
-print('Best variablesPerSplit (Regression):', bestRegVars);
-
-
-// --------------------------------------
-// Step 3: Tune minLeafPopulation
-// --------------------------------------
-var minLeafList = ee.List.sequence(1, 10, 1);  // test from 1 to 10
-
-var resultsRegLeaf = minLeafList.map(function(ml) {
-  ml = ee.Number(ml);
-
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestRegTrees,
-    variablesPerSplit: bestRegVars,
-    minLeafPopulation: ml,
-    bagFraction: 0.9
-  })
-  .setOutputMode('REGRESSION')
-  .train({
-    features: regPoints,
-    classProperty: species,
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
-
-  var testingWithPred = finalBinary.addBands(pred).sampleRegions({
-    collection: testingPoints,
-    scale: 30,
-    geometries: true
-  });
-
-  var testWithPred = testingWithPred.filter(
-    ee.Filter.eq(species + '_binary_final', 1)
-  );
-
-  var testSample = pred.sampleRegions({
-    collection: testWithPred,
-    properties: [species],
-    scale: 30
-  });
-
-  var testEval = testSample.map(function(f) {
-    var obs = ee.Number(f.get(species));
-    var p = ee.Number(f.get('Oak_density_pred'));
-    var diff = obs.subtract(p);
-    return f.set('squared_error', diff.pow(2));
-  });
-
-  var mse = testEval.aggregate_mean('squared_error');
-  var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-
-  return ee.Feature(null, {
-    minLeafPopulation: ml,
-    RMSE: rmse
-  });
-});
-
-var resultsRegLeafFC = ee.FeatureCollection(resultsRegLeaf);
-print('Regression tuning: minLeafPopulation', resultsRegLeafFC);
-
-var chartRegLeaf = ui.Chart.feature.byFeature({
-  features: resultsRegLeafFC,
-  xProperty: 'minLeafPopulation',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Min Leaf Population',
-  hAxis: {title: 'Min Leaf Population'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['orange']
-});
-print(chartRegLeaf);
-
-var bestRegLeaf = resultsRegLeafFC.sort('RMSE').first().get('minLeafPopulation');
-print('Best minLeafPopulation (Regression):', bestRegLeaf);
-
-
-// --------------------------------------
-// Step 4: Tune bagFraction
-// --------------------------------------
-var bagList = ee.List.sequence(0.3, 1.0, 0.1);  // from 0.3 to 1.0 by 0.1
-
-var resultsRegBag = bagList.map(function(bf) {
-  bf = ee.Number(bf);
-
-  var rf = ee.Classifier.smileRandomForest({
-    numberOfTrees: bestRegTrees,
-    variablesPerSplit: bestRegVars,
-    minLeafPopulation: bestRegLeaf,
-    bagFraction: bf
-  })
-  .setOutputMode('REGRESSION')
-  .train({
-    features: regPoints,
-    classProperty: species,
-    inputProperties: seasonMetrics.bandNames()
-  });
-
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
-
-  var testingWithPred = finalBinary.addBands(pred).sampleRegions({
-    collection: testingPoints,
-    scale: 30,
-    geometries: true
-  });
-
-  var testWithPred = testingWithPred.filter(
-    ee.Filter.eq(species + '_binary_final', 1)
-  );
-
-  var testSample = pred.sampleRegions({
-    collection: testWithPred,
-    properties: [species],
-    scale: 30
-  });
-
-  var testEval = testSample.map(function(f) {
-    var obs = ee.Number(f.get(species));
-    var p = ee.Number(f.get('Oak_density_pred'));
-    var diff = obs.subtract(p);
-    return f.set('squared_error', diff.pow(2));
-  });
-
-  var mse = testEval.aggregate_mean('squared_error');
-  var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-
-  return ee.Feature(null, {
-    bagFraction: bf,
-    RMSE: rmse
-  });
-});
-
-var resultsRegBagFC = ee.FeatureCollection(resultsRegBag);
-print('Regression tuning: bagFraction', resultsRegBagFC);
-
-var chartRegBag = ui.Chart.feature.byFeature({
-  features: resultsRegBagFC,
-  xProperty: 'bagFraction',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Bag Fraction',
-  hAxis: {title: 'Bag Fraction'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['green']
-});
-print(chartRegBag);
-
-var bestRegBag = resultsRegBagFC.sort('RMSE').first().get('bagFraction');
-print('Best bagFraction (Regression):', bestRegBag);
-
-
-// --------------------------------------
-// Step 5: Final optimized regression model
-// --------------------------------------
-var rfRegFinal = ee.Classifier.smileRandomForest({
-  numberOfTrees: bestRegTrees,
-  variablesPerSplit: bestRegVars,
-  minLeafPopulation: bestRegLeaf,
-  bagFraction: bestRegBag
+// 3️⃣ Train Random Forest Regression
+var rfReg = ee.Classifier.smileRandomForest({
+  numberOfTrees: 100,
+  variablesPerSplit: 5,
+  minLeafPopulation: 1,
+  bagFraction: 0.9
 })
 .setOutputMode('REGRESSION')
 .train({
   features: regPoints,
-  classProperty: species,
+  classProperty: species,   // numeric density value
   inputProperties: seasonMetrics.bandNames()
 });
 
-// Apply regression model (predicted oak density)
-var oakDensityPredFinal = seasonMetrics.classify(rfRegFinal)
-  .rename(species + '_density_pred_final');
+// 4️⃣ Apply regression model only to pixels predicted as present
+var oakDensityPred = seasonMetrics.classify(rfReg)
+  .rename('Oak_density_pred');
 
-// Mask to presence only
-var oakDensityMaskedFinal = oakDensityPredFinal.updateMask(finalBinary);
+// Use the binary mask to show density only where oak is present
+var oakPresenceMask = probPresence.gt(0.5); // Ensure this is defined
+var oakDensityMasked = oakDensityPred.updateMask(oakPresenceMask);
 
-// Visualize final predicted density
+// 5️⃣ Visualize
 Map.addLayer(
-  oakDensityMaskedFinal,
+  oakDensityMasked,
   {min: 0, max: 1, palette: ['lightyellow', 'darkgreen']},
-  species + ' Final Predicted Density (Optimized)'
+  species + ' Predicted Density (presence only)'
 );
 
-// --------------------------------------
-// Evaluate on testing data
-// --------------------------------------
-var testingWithPredFinal = finalBinary.addBands(oakDensityPredFinal).sampleRegions({
+// Export to Google Drive
+Export.image.toDrive({
+  image: oakDensityMasked,                   // your image object
+  description: species + '_Predicted_Density', // name of the task
+  folder: 'BBOW/EE/RASTERS',                      // optional: Drive folder name
+  fileNamePrefix: species + '_Predicted_Density', // output file name
+  scale: 30,                                  // pixel resolution (match your data)
+  region: oakDensityMasked.geometry(),        // export region
+  crs: 'EPSG:4326',                           // coordinate reference system
+  maxPixels: 1e13,                            // to allow large exports
+  region: geometry 
+});
+
+  //////////////////////////////////////////////
+
+
+var testingWithPred = probPresence.addBands(oakDensityPred).sampleRegions({
   collection: testingPoints,
   scale: 30,
   geometries: true
 });
 
-// Filter to where species is present
-var testWithPredFinal = testingWithPredFinal.filter(
-  ee.Filter.eq(species + '_binary_final', 1)
-);
 
-// Compute residuals and squared error
-var testEvalFinal = testWithPredFinal.map(function(f) {
+// 2️⃣ Filter to only oak presence (from binary map)
+var testWithPred = testingWithPred.filter(
+  ee.Filter.eq(species + '_binary_prediction', 1));
+
+
+// 3️⃣ Compute residuals and squared error
+// Only keep points with non-null predicted density
+var testEval = testWithPred.filter(ee.Filter.notNull(['Oak_density_pred'])).map(function(f) {
   var obs = ee.Number(f.get(species));
-  var pred = ee.Number(f.get(species + '_density_pred_final'));
+  var pred = ee.Number(f.get('Oak_density_pred'));
   var diff = obs.subtract(pred);
   return f.set({
     residual: diff,
@@ -1240,113 +617,29 @@ var testEvalFinal = testWithPredFinal.map(function(f) {
   });
 });
 
-// Compute RMSE
-var mseFinal = testEvalFinal.aggregate_mean('squared_error');
-var rmseFinal = ee.Algorithms.If(mseFinal, ee.Number(mseFinal).sqrt(), ee.Number(0));
-
-print('=== FINAL OPTIMIZED RF REGRESSION RESULTS ===');
-print('Best parameters:');
-print('  Trees:', bestRegTrees);
-print('  Vars per Split:', bestRegVars);
-print('  Min Leaf:', bestRegLeaf);
-print('  Bag Fraction:', bestRegBag);
-print('Final RMSE:', rmseFinal);
-
-/////////////////////////////////////////////////////
-
-
-// // 3️⃣ Train Random Forest Regression
-// var rfReg = ee.Classifier.smileRandomForest({
-//   numberOfTrees: 100,
-//   variablesPerSplit: 5,
-//   minLeafPopulation: 1,
-//   bagFraction: 0.9
-// })
-// .setOutputMode('REGRESSION')
-// .train({
-//   features: regPoints,
-//   classProperty: species,   // numeric density value
-//   inputProperties: seasonMetrics.bandNames()
-// });
-
-// // 4️⃣ Apply regression model only to pixels predicted as present
-// var oakDensityPred = seasonMetrics.classify(rfReg)
-//   .rename('Oak_density_pred');
-
-// // Use the binary mask to show density only where oak is present
-// //var oakPresenceMask = probPresence.gt(0.5); // Ensure this is defined
-// var oakDensityMasked = oakDensityPred.updateMask(finalBinary);
-
-// // 5️⃣ Visualize
-// Map.addLayer(
-//   oakDensityMasked,
-//   {min: 0, max: 1, palette: ['lightyellow', 'darkgreen']},
-//   species + ' Predicted Density (presence only)'
-// );
-
-// // // Export to Google Drive
-// // Export.image.toDrive({
-// //   image: oakDensityMasked,                   // your image object
-// //   description: species + '_Predicted_Density', // name of the task
-// //   folder: 'BBOW/EE/RASTERS',                      // optional: Drive folder name
-// //   fileNamePrefix: species + '_Predicted_Density', // output file name
-// //   scale: 30,                                  // pixel resolution (match your data)
-// //   region: oakDensityMasked.geometry(),        // export region
-// //   crs: 'EPSG:4326',                           // coordinate reference system
-// //   maxPixels: 1e13,                            // to allow large exports
-// //   region: geometry 
-// // });
-
-// //   //////////////////////////////////////////////
-
-
-// var testingWithPred = finalBinary.addBands(oakDensityPred).sampleRegions({
-//   collection: testingPoints,
-//   scale: 30,
-//   geometries: true
-// });
-
-
-// // 2️⃣ Filter to only oak presence (from binary map)
-// var testWithPred = testingWithPred.filter(
-//   ee.Filter.eq(species + '_binary_final', 1));
-
-
-// // 3️⃣ Compute residuals and squared error
-// // Only keep points with non-null predicted density
-// var testEval = testWithPred.filter(ee.Filter.notNull(['Oak_binary_final'])).map(function(f) {
-//   var obs = ee.Number(f.get(species));
-//   var pred = ee.Number(f.get('Oak_density_pred'));
-//   var diff = obs.subtract(pred);
-//   return f.set({
-//     residual: diff,
-//     squared_error: diff.pow(2)
-//   });
-// });
-
-// // Compute RMSE safely
-// var mse = testEval.aggregate_mean('squared_error');
-// var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-// print('RMSE (' + species + ' regression):', rmse);
+// Compute RMSE safely
+var mse = testEval.aggregate_mean('squared_error');
+var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
+print('RMSE (' + species + ' regression):', rmse);
 
 
 
-// // 6️⃣ Chart: Predicted vs Observed
-// var chart = ui.Chart.feature.byFeature({
-//   features: testEval,
-//   xProperty: species,
-//   yProperties: ['Oak_density_pred']
-// })
-// .setChartType('ScatterChart')
-// .setOptions({
-//   title: species + ' Predicted vs Observed Oak Density',
-//   hAxis: {title: 'Observed Oak Density'},
-//   vAxis: {title: 'Predicted Oak Density'},
-//   pointSize: 4,
-//   trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
-// });
+// 6️⃣ Chart: Predicted vs Observed
+var chart = ui.Chart.feature.byFeature({
+  features: testEval,
+  xProperty: species,
+  yProperties: ['Oak_density_pred']
+})
+.setChartType('ScatterChart')
+.setOptions({
+  title: species + ' Predicted vs Observed Oak Density',
+  hAxis: {title: 'Observed Oak Density'},
+  vAxis: {title: 'Predicted Oak Density'},
+  pointSize: 4,
+  trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
+});
 
-// print(chart);
+print(chart);
 
 
  });
