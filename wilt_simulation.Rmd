@@ -1,0 +1,199 @@
+---
+title: "Oak_Wilt_Simulation"
+author: "Ryan Pienaar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(terra)
+library(leaflet)
+library(tmap)
+library(tidyverse)
+library(gganimate)
+library(raster)
+
+```
+
+```{r}
+
+oakdenspath <- "G:/My Drive/BBOW EE RASTERS/Oak_Predicted_Density.tif"
+#oakdenspath <- "Y:/rpienaar/Apostle Islands/Map/Apostle_Islands_Map/Oak_Predicted_Density_Cli.tif"
+oakdens <- rast(oakdenspath)
+
+plot(oakdens)
+
+
+# Create a leaflet map object
+m <- leaflet() %>% addTiles()
+
+# Create a color palette based on your raster's values
+pal <- colorNumeric(c("red", "purple", "blue"), values(oakdens), na.color = "transparent")
+
+m %>%
+  addRasterImage(oakdens, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(oakdens),
+            title = "Your Legend Title")
+
+```
+
+```{r}
+
+densdf <- as.data.frame(oakdens, xy = TRUE)
+head(densdf)
+
+```
+
+Initialize infection
+
+```{r}
+
+set.seed(42)
+infected <- oakdens * 0
+park <- vect("Y:/rpienaar/Apostle Islands/Map/Apostle_Islands_Map/Admin_Shapefiles/Apostle Islands National Lakeshore.shp")
+if (!identical(crs(infected), crs(park))) park <- project(park, crs(infected))
+infected <- crop(infected, park)
+infected <- mask(infected, park)
+
+# find non-NA cells (inside park) and pick one at random
+valid_cells <- which(!is.na(infected[]))
+chosen <- sample(valid_cells, 1)
+
+infected[chosen] <- 1
+
+# get cell centroid in raster CRS
+cent <- xyFromCell(infected_r, chosen)
+
+# transform centroid to lon/lat (WGS84) if raster is projected
+cent_sp <- SpatialPoints(matrix(cent, ncol = 2), proj4string = crs(infected_r))
+cent_ll  <- spTransform(cent_sp, CRS("+proj=longlat +datum=WGS84"))
+cent_coords <- coordinates(cent_ll)[1, ]
+
+# palette (NA transparent)
+pal <- colorFactor(c("green","red"), domain = c(0,1), na.color = "transparent")
+
+# map: raster + red circle marker over the infected cell
+leaflet() %>%
+  addTiles() %>%
+  addRasterImage(infected_r, colors = pal, opacity = 0.9, project = FALSE) %>%
+  addCircleMarkers(lng = cent_coords[1], lat = cent_coords[2],
+                   radius = 8, color = "red", fill = TRUE, fillOpacity = 1, stroke = FALSE) %>%
+  addLegend(pal = pal, values = c(0,1), labels = c("Uninfected","Infected"))
+```
+
+
+```{r}
+
+# infected: SpatRaster with values 0/1 and NA outside park
+# If you currently have a raster::RasterLayer, convert:
+# infected <- rast(infected_r)
+
+# ensure values are numeric 0/1
+infected[] <- as.integer(infected[])
+
+years <- 50
+w <- matrix(1, 3, 3)   # 3x3 window => queen neighbourhood
+
+# optional: store snapshots (if you want to inspect each year)
+snapshots <- list()
+snapshots[[1]] <- infected
+
+for (yr in 1:years) {
+  # neighbourhood max: 1 if any neighbour (or the cell itself) is infected
+  neigh_max <- focal(infected, w = w, fun = max, na.rm = TRUE)
+  
+  # ensure we keep NA outside park: force neigh_max to NA where raster is NA
+  neigh_max[is.na(infected)] <- NA
+  
+  # logical raster: should be infected after this year (1 if any neighbour==1)
+  will_be_infected <- neigh_max == 1
+  
+  # numeric 0/1 raster (keep NA)
+  will_be_infected_num <- will_be_infected
+  will_be_infected_num[] <- as.integer(values(will_be_infected))
+  
+  # update: keep previously infected, and infect any cell that will_be_infected
+  old_vals <- values(infected)
+  new_vals <- values(will_be_infected_num)
+  updated <- pmax(old_vals, new_vals, na.rm = TRUE)
+  # preserve NA mask (cells that were NA should stay NA)
+  updated[is.na(old_vals)] <- NA
+  
+  # write back to raster
+  infected[] <- updated
+  
+  snapshots[[yr + 1]] <- infected
+  
+  # check if any new infection occurred; break if none
+  if (all(updated == old_vals, na.rm = TRUE)) {
+    message("No new infections at year ", yr, "; stopping early.")
+    break
+  }
+  
+  message("Year ", yr, " done; infected cells: ", sum(values(infected) == 1, na.rm = TRUE))
+}
+
+# 'infected' now contains the final state, 'snapshots' has yearly rasters (1..N)
+
+```
+
+```{r}
+# Minimal Shiny app to step through snapshots
+# Requires: shiny, leaflet, raster, terra, sp
+
+library(shiny)
+library(leaflet)
+library(raster)
+library(terra)
+library(sp)
+
+# prepare raster frames on disk or in memory
+# convert snapshots to raster::RasterLayer and store in a list
+r_list <- lapply(snapshots, function(x) raster(x))  # snapshots[[1]] = year 0
+
+ui <- fluidPage(
+  titlePanel("Infection spread — step through years"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("year", "Year", min = 0, max = length(r_list) - 1, value = 0, step = 1, animate = animationOptions(interval = 800))
+    ),
+    mainPanel(
+      leafletOutput("map", height = "700px")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  pal <- colorFactor(c("green", "red"), domain = c(0,1), na.color = "transparent")
+
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addTiles() %>%
+      setView(lng = -91.0, lat = 46.95, zoom = 10)  # adjust center/zoom to your area
+  })
+
+  observe({
+    yr <- input$year
+    r <- r_list[[yr + 1]]   # list index
+    leafletProxy("map", data = r) %>%
+      clearImages() %>%
+      addRasterImage(r, colors = pal, opacity = 0.9, project = FALSE) %>%
+      clearControls() %>%
+      addLegend(pal = pal, values = c(0,1), labels = c("Uninfected","Infected"), position = "bottomright")
+  })
+}
+
+ runApp(list(ui = ui, server = server))
+```
+
+
+
+```{r}
+
+```
+
