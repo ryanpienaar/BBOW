@@ -65,7 +65,8 @@ valid_cells <- which(!is.na(infected[]))
 chosen <- sample(valid_cells, 1)
 
 infected[chosen] <- 1
-
+inf_initial <- infected
+infected_r <- raster(infected)
 # get cell centroid in raster CRS
 cent <- xyFromCell(infected_r, chosen)
 
@@ -85,7 +86,7 @@ leaflet() %>%
                    radius = 8, color = "red", fill = TRUE, fillOpacity = 1, stroke = FALSE) %>%
   addLegend(pal = pal, values = c(0,1), labels = c("Uninfected","Infected"))
 ```
-
+Base Model
 
 ```{r}
 
@@ -96,7 +97,7 @@ leaflet() %>%
 # ensure values are numeric 0/1
 infected[] <- as.integer(infected[])
 
-years <- 50
+years <- 20
 w <- matrix(1, 3, 3)   # 3x3 window => queen neighbourhood
 
 # optional: store snapshots (if you want to inspect each year)
@@ -141,6 +142,8 @@ for (yr in 1:years) {
 # 'infected' now contains the final state, 'snapshots' has yearly rasters (1..N)
 
 ```
+
+Base Model
 
 ```{r}
 # Minimal Shiny app to step through snapshots
@@ -188,10 +191,259 @@ server <- function(input, output, session) {
   })
 }
 
- runApp(list(ui = ui, server = server))
+# runApp(list(ui = ui, server = server))
+```
+
+Align rasters
+
+```{r}
+
+# project oakdens to the infected CRS (if different)
+if (!compareGeom(infected, oakdens, stopOnError = FALSE, crs = TRUE)) {
+  oakdens_proj <- project(oakdens, infected, method = "bilinear")   # continuous => bilinear
+} else {
+  oakdens_proj <- oakdens
+}
+
+# resample oakdens to the exact grid (extent, resolution, origin) of infected
+# This will align the cells and extent to be identical to 'infected'
+oakdens_aligned <- resample(oakdens_proj, infected, method = "bilinear")
+oakdens <- oakdens_aligned
+
 ```
 
 
+Parameterized model
+
+```{r}
+
+
+
+# Simulate infection spread with transmission probability dependent on oak density
+#
+# Requires: terra
+# Inputs expected in the environment:
+# - infected_r : RasterLayer (from raster) or SpatRaster with values 0/1 and NA outside park
+# - oakdens    : RasterLayer or SpatRaster with oak density (numeric) and same extent/resolution/mask as infected_r
+#
+# Behaviour:
+# - For each susceptible cell, consider all 8 neighbours + itself (3x3 queen neighbourhood).
+# - For each infected neighbour i, compute a transmission probability p_i that depends on
+#   the oak density of the infected neighbour (d_src) and the focal target cell (d_tgt).
+# - The cell becomes infected with probability 1 - prod_i (1 - p_i), i.e. probability at least one neighbour transmits.
+# - Already infected cells remain infected.
+# - Cells that are NA in the original infected raster stay NA.
+#
+# Parameters to tune:
+# - years: number of years to simulate
+# - beta: transmission scaling parameter (higher -> higher probabilities)
+# - transmission_fun: function(d_src, d_tgt, beta) returning a probability in [0,1]
+# - seed: optional RNG seed for reproducible stochastic runs
+#
+# Example usage:
+# infected <- rast(infected_r)     # convert if needed
+# oakdens  <- rast(oakdens_r)
+# source("infectious_spread_with_oak_density.R")
+# res <- simulate_spread(infected, oakdens, years = 50, beta = 1.0, seed = 42)
+
+
+simulate_spread <- function(infected,
+                            oakdens,
+                            years = 50,
+                            beta = 1.0,
+                            transmission_fun = NULL,
+                            seed = NULL,
+                            store_snapshots = TRUE,
+                            verbose = TRUE) {
+  # Input checks
+  if (!inherits(infected, "SpatRaster")) infected <- rast(infected)
+  if (!inherits(oakdens, "SpatRaster"))  oakdens  <- rast(oakdens)
+  if (!compareGeom(infected, oakdens, stopOnError = FALSE)) {
+    stop("infected and oakdens must have the same extent, resolution and CRS")
+  }
+  # ensure integer 0/1 and keep NA mask
+  infected[] <- as.integer(values(infected))
+  
+  # default transmission function if not provided:
+  # uses average density of source and target, scaled by beta, with a saturating transform
+  # p = 1 - exp(-beta * (d_src + d_tgt)/2)
+  if (is.null(transmission_fun)) {
+    transmission_fun <- function(d_src, d_tgt, beta) {
+      mu <- (d_src + d_tgt) / 2
+      # ensure non-negative
+      mu[is.na(mu)] <- 0
+      p <- 1 - exp(-beta * mu)
+      p[p < 0] <- 0
+      p[p > 1] <- 1
+      return(p)
+    }
+  }
+  
+  # window for queen neighbourhood (3x3)
+  w <- matrix(1, 3, 3)
+  
+  # snapshots
+  snapshots <- list()
+  if (store_snapshots) snapshots[[1]] <- infected
+  
+  # option for reproducibility
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Precompute oak density values matrix to allow fast indexing if needed
+  # But using terra::focal we can compute neighbourhood-based operations.
+  # We'll iterate years and for each susceptible cell:
+  # - collect infected neighbours (3x3 binary)
+  # - extract d_src values for neighbours and d_tgt (center)
+  # - compute p_i for each infected neighbour, aggregate to overall probability
+  #
+  # Implementation detail:
+  # We will use focal() to get, for each focal cell, the 3x3 values of infected and oakdens
+  # However terra::focal returns a single summary per cell. To get full neighbourhood matrices
+  # we will extract cell indices of all neighbours once and use adjacent() combined with values().
+  #
+  # For clarity and correctness (and because raster sizes can be moderate), we implement neighbour
+  # enumeration via terra::adjacent which is memory efficient.
+  
+  # Prepare index mapping
+  ncell <- ncell(infected)
+  cells_idx <- 1:ncell
+  
+  # Precompute adjacency lists (queen = TRUE)
+  # adjacent returns a matrix with from,to pairs. We'll convert to a list: for each target cell, the vector of neighbour cell indices (including itself).
+  if (verbose) message("Computing adjacency (neighbour) lists...")
+  adj_pairs <- adjacent(infected, cells = cells_idx, directions = 8, pairs = TRUE, include = TRUE)
+  # adjacent(..., include = TRUE) will include self as neighbour in some versions; if not, we'll add it.
+  # adj_pairs: matrix with two columns: from, to
+  # We want for each target (to) the list of 'from' neighbours
+  neigh_list <- vector("list", ncell)
+  # adj_pairs might be a two-column matrix or data.frame
+  adj_from <- adj_pairs[,1]
+  adj_to   <- adj_pairs[,2]
+  for (i in seq_along(adj_from)) {
+    t <- adj_to[i]
+    neigh_list[[t]] <- c(neigh_list[[t]], adj_from[i])
+  }
+  # Ensure self is included (some terra versions' adjacent(..., include=TRUE) already includes)
+  for (cell in cells_idx) {
+    if (!(cell %in% neigh_list[[cell]])) neigh_list[[cell]] <- c(neigh_list[[cell]], cell)
+  }
+  
+  # get initial values as vectors for fast operations
+  infected_vals <- values(infected)   # integer 0/1/NA
+  oak_vals      <- values(oakdens)    # numeric, NA outside park possibly
+  
+  if (verbose) message("Starting simulation for up to ", years, " years...")
+  for (yr in seq_len(years)) {
+    old_vals <- infected_vals  # 0/1/NA
+    # will hold next state
+    new_vals <- old_vals
+    
+    # For each not-yet-infected but non-NA cell, compute infection probability from infected neighbours
+    susceptible_idx <- which(!is.na(old_vals) & old_vals == 0)
+    if (length(susceptible_idx) == 0) {
+      if (verbose) message("No susceptible cells remain at year ", yr - 1, "; stopping.")
+      break
+    }
+    
+    # We'll vectorize across susceptible cells in a loop -- could be parallelized if needed
+    for (cell in susceptible_idx) {
+      neighs <- neigh_list[[cell]]
+      # infected neighbours (exclude NA neighbours)
+      neigh_infected_mask <- !is.na(old_vals[neighs]) & (old_vals[neighs] == 1)
+      if (!any(neigh_infected_mask)) next  # no infected neighbours -> remains susceptible
+      
+      infected_neigh_ids <- neighs[neigh_infected_mask]
+      # densities
+      d_src <- oak_vals[infected_neigh_ids]   # source densities
+      d_tgt <- oak_vals[cell]                 # target density (single value)
+      # handle possible NA densities: if either NA, treat density as 0 for transmission calc (or you can choose another rule)
+      # here we treat NA as 0 to avoid NA probabilities
+      d_src[is.na(d_src)] <- 0
+      if (is.na(d_tgt)) d_tgt <- 0
+      
+      # compute p_i for each infected neighbour
+      p_i <- transmission_fun(d_src, d_tgt, beta)
+      # ensure within [0,1]
+      p_i[is.na(p_i)] <- 0
+      p_i[p_i < 0] <- 0
+      p_i[p_i > 1] <- 1
+      
+      # combined probability that at least one neighbour transmits:
+      p_any <- 1 - prod(1 - p_i)
+      
+      # stochastic infection: sample Bernoulli(p_any)
+      if (runif(1) < p_any) {
+        new_vals[cell] <- 1L
+      } else {
+        new_vals[cell] <- 0L
+      }
+    } # end per-susceptible cell loop
+    
+    # preserve NA mask: ensure cells that were NA remain NA
+    new_vals[is.na(old_vals)] <- NA_integer_
+    
+    infected_vals <- new_vals
+    
+    # check for changes
+    changed <- !identical(new_vals, old_vals)
+    # update raster object values
+    infected[] <- infected_vals
+    
+    if (store_snapshots) snapshots[[yr + 1]] <- infected
+    
+    # progress messages
+    if (verbose) {
+      n_infected <- sum(infected_vals == 1, na.rm = TRUE)
+      message("Year ", yr, " done; infected cells: ", n_infected)
+    }
+    
+    # stop early if no new infections occurred
+    if (!changed) {
+      if (verbose) message("No new infections at year ", yr, "; stopping early.")
+      break
+    }
+  } # end years loop
+  
+  # return results
+  return(list(final = infected,
+              snapshots = if (store_snapshots) snapshots else NULL,
+              params = list(years = years, beta = beta),
+              oakdens = oakdens))
+}
+
+# Example of a custom transmission function you might want to use:
+# - linear combination: p = min(1, beta * (alpha_src * d_src + alpha_tgt * d_tgt))
+# - or make transmission mostly driven by source density:
+example_trans_fun <- function(d_src, d_tgt, beta) {
+  # alpha weights
+  alpha_src <- 0.7
+  alpha_tgt <- 0.3
+  p_raw <- beta * (alpha_src * d_src + alpha_tgt * d_tgt)
+  p <- pmin(1, p_raw)
+  p[is.na(p)] <- 0
+  p
+}
+
+# End of file
+
+```
+
+```{r}
+
+# keep example_trans_fun defined as earlier:
+# example_trans_fun <- function(d_src, d_tgt, beta) { ... }
+
+# pass a function (do not call example_trans_fun)
+res <- simulate_spread(
+  inf_initial,
+  oakdens_aligned,
+  years = 10,
+  transmission_fun = function(d_src, d_tgt, beta) example_trans_fun(d_src, d_tgt, 1),
+  seed = 42
+)
+
+
+```
 
 ```{r}
 
