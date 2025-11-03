@@ -1,7 +1,5 @@
 
 
-
-
 // Display AOI
 Map.centerObject(geometry, 11);
 Map.addLayer(newdata, {}, 'Point Locations')
@@ -380,7 +378,7 @@ seasonMetrics = seasonMetrics.addBands(summaryBands);
 //seasonMetrics = seasonMetrics.select("EVI_mean", "SOS", "EOS", "PeakEVI", "POS", "LOS")
   
 print('Bands:', seasonMetrics.bandNames());
-Map.addLayer(seasonMetrics, {}, "seasonMetrics")
+//Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 
 ///////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
@@ -389,9 +387,6 @@ Map.addLayer(seasonMetrics, {}, "seasonMetrics")
 ///////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
 
-
-// Define color palette
-var palette = ['white', 'green'];
 
 // ---------------------------------------------
 // Dominance Map
@@ -411,140 +406,143 @@ var speciesList = [ "Oak"];
 
 speciesList.forEach(function(species) {
 
-var points = newdata
+// var points = newdata
 
 
- // Add lat/lon as properties if they don't already exist
-  var withCoords = newdata.map(function(f) {
-    var coords = f.geometry().coordinates();
-    return f.set({
-      longitude: coords.get(0),
-      latitude: coords.get(1)
-    });
-  });
+// // Add lat/lon as properties if they don't already exist
+//   var withCoords = newdata.map(function(f) {
+//     var coords = f.geometry().coordinates();
+//     return f.set({
+//       longitude: coords.get(0),
+//       latitude: coords.get(1)
+//     });
+//   });
 
-  // Keep only ID, coordinates, and the current species property
-  var keepProps = ['ID', 'longitude', 'latitude', species];
-  var points = withCoords.map(function(f) {
-    return f.select(keepProps);
-  });
+//   // Keep only ID, coordinates, and the current species property
+//   var keepProps = ['ID', 'longitude', 'latitude', species];
+//   var points = withCoords.map(function(f) {
+//     return f.select(keepProps);
+//   });
   
-  // Add presence/absence property (1 if > 0, else 0)
-  var pointsPA = points.map(function(f) {
-    var pa = ee.Number(f.get(species)).gt(0).int();
-    return f.set(species +' Obs_Presence', pa);
-  });
+//   // Add presence/absence property (1 if > 0, else 0)
+//   var pointsPA = points.map(function(f) {
+//     var pa = ee.Number(f.get(species)).gt(0).int();
+//     return f.set(species +' Obs_Presence', pa);
+//   });
 
-  // print(species + ' subset points:', pointsPA);
-  // print(species + ' subset property names:', points.first().propertyNames());
+//   //print(species + ' subset points:', pointsPA);
+//   //print(species + ' subset property names:', points.first().propertyNames());
   
-   // Split into presence and absence
-  var presence = pointsPA.filter(ee.Filter.eq(species+' Obs_Presence', 1));
-  var absence  = pointsPA.filter(ee.Filter.eq(species+' Obs_Presence', 0));
+//   // Split into presence and absence
+//   var presence = pointsPA.filter(ee.Filter.eq(species+' Obs_Presence', 1));
+//   var absence  = pointsPA.filter(ee.Filter.eq(species+' Obs_Presence', 0));
 
-  // Count both
-  var nPresence = presence.size();
-  var nAbsence  = absence.size();
-  // print(species + ' presence count:', nPresence);
-  // print(species + ' absence count:', nAbsence);
+//   // Count both
+//   var nPresence = presence.size();
+//   var nAbsence  = absence.size();
+//   //print(species + ' presence count:', nPresence);
+//   //print(species + ' absence count:', nAbsence);
 
-  // Sample equal number of each (based on the smaller group)
-  var nSamples = nPresence.min(nAbsence);
+//   // Sample equal number of each (based on the smaller group)
+//   var nSamples = nPresence.min(nAbsence);
 
-  var presenceSample = presence.randomColumn('rand').sort('rand').limit(nSamples);
-  var absenceSample  = absence.randomColumn('rand').sort('rand').limit(nSamples);
+//   var presenceSample = presence.randomColumn('rand').sort('rand').limit(nSamples);
+//   var absenceSample  = absence.randomColumn('rand').sort('rand').limit(nSamples);
 
-  // Merge balanced set
-  var balancedPoints = presenceSample.merge(absenceSample);
+//   // Merge balanced set
+//   var balancedPoints = presenceSample.merge(absenceSample);
 
-  // print(species + ' balanced dataset:', balancedPoints);
-  // print(species + ' balanced size:', balancedPoints.size());
+//   //print(species + ' balanced dataset:', balancedPoints);
+//   //print(species + ' balanced size:', balancedPoints.size());
   
-var data = seasonMetrics.sampleRegions({
-    collection: balancedPoints,
-    //properties: ['ID', 'longitude', 'latitude', species, species + '_Obs_Presence'],
-    scale: 30,
-    geometries: true
+// var data = seasonMetrics.sampleRegions({
+//     collection: balancedPoints,
+//     //properties: ['ID', 'longitude', 'latitude', species, species + '_Obs_Presence'],
+//     scale: 30,
+//     geometries: true
+//   });
+
+
+
+// var withRandom = data.randomColumn('random', 42)
+
+// // Define training and testing sets
+// var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
+// var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
+
+// ------------------------------------------------------
+// Step 1: Prepare point data with coordinates + PA
+// ------------------------------------------------------
+var withCoords = newdata.map(function(f) {
+  var coords = f.geometry().coordinates();
+  return f.set({
+    longitude: coords.get(0),
+    latitude: coords.get(1)
   });
+});
 
+var keepProps = ['ID', 'longitude', 'latitude', species];
+var points = withCoords.map(function(f) {
+  return f.select(keepProps);
+});
 
+var pointsPA = points.map(function(f) {
+  var pa = ee.Number(f.get(species)).gt(0).int();
+  return f.set(species + ' Obs_Presence', pa);
+});
 
-var withRandom = data.randomColumn('random', 42)
+// ------------------------------------------------------
+// Step 2: Sample seasonMetrics at point locations
+// ------------------------------------------------------
+var sampledPoints = seasonMetrics.sampleRegions({
+  collection: pointsPA,
+  scale: 30,
+  geometries: true
+});
 
-// Define training and testing sets
-var trainingPoints = withRandom.filter(ee.Filter.lt('random', 0.7));  // 70%
-var testingPoints = withRandom.filter(ee.Filter.gte('random', 0.7));  // 30%
+// ------------------------------------------------------
+// Step 3: Balance presence/absence counts
+// ------------------------------------------------------
+var presence = sampledPoints.filter(ee.Filter.eq(species + ' Obs_Presence', 1));
+var absence  = sampledPoints.filter(ee.Filter.eq(species + ' Obs_Presence', 0));
 
+var nPresence = presence.size();
+var nAbsence  = absence.size();
+var nSamples  = nPresence.min(nAbsence);
 
-print('trainingPoints', trainingPoints)
-print('testingPoints', testingPoints)
+var presenceSample = presence.randomColumn('rand').sort('rand').limit(nSamples);
+var absenceSample  = absence.randomColumn('rand').sort('rand').limit(nSamples);
+
+var balancedPoints = presenceSample.merge(absenceSample);
+
+// ------------------------------------------------------
+// Step 4: Split into training/testing sets (random 70/30)
+// ------------------------------------------------------
+balancedPoints = balancedPoints.randomColumn('rand', 42);
+var split = 0.7;
+var trainingPoints = balancedPoints.filter(ee.Filter.lt('rand', split));
+var testingPoints  = balancedPoints.filter(ee.Filter.gte('rand', split));
+
+// ------------------------------------------------------
+// Step 5: Show counts by class in training/testing sets
+// ------------------------------------------------------
+
+// Count presence/absence for training
+var trainCounts = trainingPoints.aggregate_histogram(species + ' Obs_Presence');
+var testCounts  = testingPoints.aggregate_histogram(species + ' Obs_Presence');
+
+// print('Training points by class (0=absence, 1=presence):', trainCounts);
+// print('Testing points by class (0=absence, 1=presence):', testCounts);
+
+// Optionally, individual totals:
+// print('Total training points:', trainingPoints.size());
+// print('Total testing points:', testingPoints.size());
 
 
 // ----------------------
 // RF accuracy vs nTrees
 // ----------------------
 
-// --------------------------------------
-// Step 0: Create testingPoints proportional to class area (based on point counts)
-// --------------------------------------
-
-// Count number of points per class in the training data (returns a server-side Dictionary)
-var classCounts = trainingPoints.aggregate_histogram(species + ' Obs_Presence');
-
-// Keys are class labels (as strings)
-var classList = classCounts.keys(); // ee.List
-
-// Total number of test points you want overall
-var totalTestPoints = 200; // adjust as needed
-
-// Total count (sum of all class counts)
-var totalCount = ee.Number(classCounts.values().reduce(ee.Reducer.sum()));
-
-// Map over classes to create per-class test subsets
-var testingSamplesList = classList.map(function(c) {
-  // c is a string, convert to number if necessary
-  var classValue = ee.Number.parse(c);
-  var count = ee.Number(classCounts.get(c)); // count of points for this class
-
-  // proportion of this class in the points
-  var proportion = count.divide(totalCount);
-
-  // number of test points for this class (rounded)
-  var n = proportion.multiply(totalTestPoints).round();
-
-  // optionally ensure at least 1 sample for classes that exist:
-  // var n = proportion.multiply(totalTestPoints).round().max(1);
-
-  // Subset points of that class
-  var classSubset = trainingPoints.filter(ee.Filter.eq(species + ' Obs_Presence', classValue));
-
-  // Add a random column and pick n points
-  var sampleSubset = classSubset.randomColumn('rand').sort('rand').limit(n);
-
-  return sampleSubset;
-});
-
-// Merge the list of per-class FeatureCollections into a single FC
-var testingPoints = ee.FeatureCollection(testingSamplesList).flatten();
-
-// Now remove testing points from the original trainingPoints.
-// We invert an inList filter by calling .not() on it:
-var testIDs = testingPoints.aggregate_array('system:index'); // server-side list of indices
-var trainingPointsNew = trainingPoints.filter(
-  ee.Filter.inList('system:index', testIDs).not()
-);
-
-// Reassign variables (optional)
-testingPoints = ee.FeatureCollection(testingPoints);
-trainingPoints = ee.FeatureCollection(trainingPointsNew);
-
-// Quick prints for sanity-checking
-print('Total test points requested:', totalTestPoints);
-print('Actual testingPoints count:', testingPoints.size());
-print('Remaining trainingPoints count:', trainingPoints.size());
-
-
-// Replace your old testingPoints and trainingPoints
 
 
 // -------------------------------
@@ -586,24 +584,26 @@ var resultsTrees = nTreeList.map(function(nt) {
 });
 
 var resultsTreesFC = ee.FeatureCollection(resultsTrees);
-print('Tuning nTrees results:', resultsTreesFC);
+//print('Tuning nTrees results:', resultsTreesFC);
 
-// Plot accuracy & kappa vs number of trees
-var chartTrees = ui.Chart.feature.byFeature({
-  features: resultsTreesFC,
-  xProperty: 'nTrees',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Number of Trees',
-  hAxis: {title: 'Number of Trees'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['blue', 'red']
-});
-print(chartTrees);
+// // Plot accuracy & kappa vs number of trees
+// var chartTrees = ui.Chart.feature.byFeature({
+//   features: resultsTreesFC,
+//   xProperty: 'nTrees',
+//   yProperties: ['Accuracy', 'Kappa']
+// }).setOptions({
+//   title: 'RF Performance vs Number of Trees',
+//   hAxis: {title: 'Number of Trees'},
+//   vAxis: {title: 'Metric Value'},
+//   colors: ['blue', 'red']
+// });
+// print(chartTrees);
 
 // Extract best number of trees based on highest accuracy
 var bestTrees = resultsTreesFC.sort('Accuracy', false).first().get('nTrees');
-print('Best number of trees:', bestTrees);
+// print('Best number of trees:', bestTrees);
+
+
 
 // -----------------------------------
 // Step 2: Tune variablesPerSplit
@@ -644,24 +644,24 @@ var resultsVars = varsList.map(function(vs) {
 });
 
 var resultsVarsFC = ee.FeatureCollection(resultsVars);
-print('Tuning variablesPerSplit results:', resultsVarsFC);
+//print('Tuning variablesPerSplit results:', resultsVarsFC);
 
 // Plot accuracy & kappa vs variablesPerSplit
-var chartVars = ui.Chart.feature.byFeature({
-  features: resultsVarsFC,
-  xProperty: 'variablesPerSplit',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Variables per Split',
-  hAxis: {title: 'Variables per Split'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['green', 'orange']
-});
-print(chartVars);
+// var chartVars = ui.Chart.feature.byFeature({
+//   features: resultsVarsFC,
+//   xProperty: 'variablesPerSplit',
+//   yProperties: ['Accuracy', 'Kappa']
+// }).setOptions({
+//   title: 'RF Performance vs Variables per Split',
+//   hAxis: {title: 'Variables per Split'},
+//   vAxis: {title: 'Metric Value'},
+//   colors: ['green', 'orange']
+// });
+// print(chartVars);
 
 // Get best variablesPerSplit
 var bestVars = resultsVarsFC.sort('Accuracy', false).first().get('variablesPerSplit');
-print('Best variablesPerSplit:', bestVars);
+// print('Best variablesPerSplit:', bestVars);
 
 // --------------------------------------
 // Step 3: Tune minLeafPopulation
@@ -703,22 +703,22 @@ var resultsLeaf = minLeafList.map(function(ml) {
 });
 
 var resultsLeafFC = ee.FeatureCollection(resultsLeaf);
-print('Tuning minLeafPopulation results:', resultsLeafFC);
+//print('Tuning minLeafPopulation results:', resultsLeafFC);
 
-var chartLeaf = ui.Chart.feature.byFeature({
-  features: resultsLeafFC,
-  xProperty: 'minLeafPopulation',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Min Leaf Population',
-  hAxis: {title: 'Min Leaf Population'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['purple', 'red']
-});
-print(chartLeaf);
+// var chartLeaf = ui.Chart.feature.byFeature({
+//   features: resultsLeafFC,
+//   xProperty: 'minLeafPopulation',
+//   yProperties: ['Accuracy', 'Kappa']
+// }).setOptions({
+//   title: 'RF Performance vs Min Leaf Population',
+//   hAxis: {title: 'Min Leaf Population'},
+//   vAxis: {title: 'Metric Value'},
+//   colors: ['purple', 'red']
+// });
+// print(chartLeaf);
 
 var bestLeaf = resultsLeafFC.sort('Accuracy', false).first().get('minLeafPopulation');
-print('Best minLeafPopulation:', bestLeaf);
+// print('Best minLeafPopulation:', bestLeaf);
 
 // --------------------------------------
 // Step 4: Tune bagFraction
@@ -760,22 +760,22 @@ var resultsBag = bagList.map(function(bf) {
 });
 
 var resultsBagFC = ee.FeatureCollection(resultsBag);
-print('Tuning bagFraction results:', resultsBagFC);
+//print('Tuning bagFraction results:', resultsBagFC);
 
-var chartBag = ui.Chart.feature.byFeature({
-  features: resultsBagFC,
-  xProperty: 'bagFraction',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'RF Performance vs Bag Fraction',
-  hAxis: {title: 'Bag Fraction'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['teal', 'red']
-});
-print(chartBag);
+// var chartBag = ui.Chart.feature.byFeature({
+//   features: resultsBagFC,
+//   xProperty: 'bagFraction',
+//   yProperties: ['Accuracy', 'Kappa']
+// }).setOptions({
+//   title: 'RF Performance vs Bag Fraction',
+//   hAxis: {title: 'Bag Fraction'},
+//   vAxis: {title: 'Metric Value'},
+//   colors: ['teal', 'red']
+// });
+// print(chartBag);
 
 var bestBag = resultsBagFC.sort('Accuracy', false).first().get('bagFraction');
-print('Best bagFraction:', bestBag);
+// print('Best bagFraction:', bestBag);
 
 // --------------------------------------
 // Step 6: Tune probability threshold
@@ -823,48 +823,124 @@ var resultsThresh = thresholdList.map(function(th) {
 });
 
 var resultsThreshFC = ee.FeatureCollection(resultsThresh);
-print('Tuning probability threshold results:', resultsThreshFC);
+//print('Tuning probability threshold results:', resultsThreshFC);
 
 // Plot Accuracy & Kappa vs Threshold
-var chartThresh = ui.Chart.feature.byFeature({
-  features: resultsThreshFC,
-  xProperty: 'Threshold',
-  yProperties: ['Accuracy', 'Kappa']
-}).setOptions({
-  title: 'Model Performance vs Probability Threshold',
-  hAxis: {title: 'Threshold'},
-  vAxis: {title: 'Metric Value'},
-  colors: ['blue', 'red']
-});
-print(chartThresh);
+// var chartThresh = ui.Chart.feature.byFeature({
+//   features: resultsThreshFC,
+//   xProperty: 'Threshold',
+//   yProperties: ['Accuracy', 'Kappa']
+// }).setOptions({
+//   title: 'Model Performance vs Probability Threshold',
+//   hAxis: {title: 'Threshold'},
+//   vAxis: {title: 'Metric Value'},
+//   colors: ['blue', 'red']
+// });
+// print(chartThresh);
 
 // Get best threshold based on Accuracy
 var bestThresh = resultsThreshFC.sort('Accuracy', false).first().get('Threshold');
-print('Best Threshold:', bestThresh);
+//print('Best Threshold:', bestThresh);
 
 // --------------------------------------
 // Step 7: Apply final model and threshold
 // --------------------------------------
 var finalBinary = probImage.gt(0.7).rename(species + '_binary_final');
 
+// Define pixel area (each 30 m pixel = 900 m²)
+var pixelArea = ee.Image.pixelArea();
+
+// Mask and count class 0 (absence)
+var area0 = pixelArea.updateMask(finalBinary.select(species + '_binary_final').eq(0))
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e13,
+    tileScale: 4
+  }).get('area');
+
+// Mask and count class 1 (presence)
+var area1 = pixelArea.updateMask(finalBinary.select(species + '_binary_final').eq(1))
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e13,
+    tileScale: 4
+  }).get('area');
+
+// Convert to pixel counts (divide by 900 m² per pixel)
+var count0 = ee.Number(area0).divide(900);
+var count1 = ee.Number(area1).divide(900);
+
+//print('Pixel counts:', count0, count1);
+
+var ratio = count0.divide(count1);
+//print('Ratio (count0 : count1) =', ratio.format('%.2f'));
+
+//print(testingPoints)
+
+var totalPts = 33;  // your total number of test points
+
+// ratio = count0 / count1  → so fraction of 0s = ratio / (1 + ratio)
+var frac0 = ratio.divide(ratio.add(1));
+var frac1 = ee.Number(1).divide(ratio.add(1));
+
+// Compute proportional counts
+var n0 = frac0.multiply(totalPts).round();
+var n1 = frac1.multiply(totalPts).round();
+
+//print('Target counts → absence (0):', n0, ' presence (1):', n1);
+
+// Define the property name dynamically
+var obsProp = species + ' Obs_Presence';
+
+// Split your collection
+var presPoints = testingPoints.filter(ee.Filter.eq(obsProp, 1));
+var absPoints  = testingPoints.filter(ee.Filter.eq(obsProp, 0));
+
+// Randomize and take subsets
+presPoints = presPoints.randomColumn('rand').sort('rand').limit(n1);
+absPoints  = absPoints.randomColumn('rand').sort('rand').limit(n0);
+
+// Merge into a new proportional collection
+var testingPoints_ratio = absPoints.merge(presPoints);
+
+print('Number of points in final balanced set:', testingPoints_ratio.size());
+
 var testFinal = finalBinary.sampleRegions({
-  collection: testingPoints,
+  collection: testingPoints_ratio,
   properties: [species + ' Obs_Presence'],
   scale: 30
 });
 
 var finalConf = testFinal.errorMatrix(species + ' Obs_Presence', species + '_binary_final');
-print('=== FINAL OPTIMIZED MODEL RESULTS ===');
+print(species + '=== FINAL OPTIMIZED MODEL RESULTS ===');
 print('Confusion Matrix:', finalConf);
 print('Overall Accuracy:', finalConf.accuracy());
 print('Kappa:', finalConf.kappa());
 print('Producers Accuracy:', finalConf.producersAccuracy());
 print('Users Accuracy:', finalConf.consumersAccuracy());
 
+
+
 // Add map layer
 Map.addLayer(finalBinary,
   {min: 0, max: 1, palette: ['white', 'green']},
   species + ' Final Optimized Prediction');
+
+// Define export parameters
+Export.image.toDrive({
+  image: finalBinary,  // the image you want to export
+  description: species + '_FinalOptimizedPrediction', // export task name
+  folder: 'GEE_Exports',  // optional: folder in your Google Drive
+  fileNamePrefix: species + '_FinalOptimizedPrediction', 
+  region: finalBinary.geometry(),  // the export region; adjust if needed
+  scale: 30,  // resolution in meters; adjust to match your data
+  maxPixels: 1e13  // to allow large exports
+});
+
 
 // // -----------------------
 // // 3. Stage 2: Regression model (only where proportion > 0)
@@ -891,7 +967,7 @@ var regPoints = trainingWithPred.filter(
 // --------------------------------------
 // Step 1: Tune numberOfTrees
 // --------------------------------------
-var nTreeList = ee.List.sequence(50, 2000, 50);
+var nTreeList = ee.List.sequence(50, 10000, 50);
 
 var resultsRegTrees = nTreeList.map(function(nt) {
   nt = ee.Number(nt);
@@ -910,7 +986,7 @@ var resultsRegTrees = nTreeList.map(function(nt) {
   });
 
 
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
+  var pred = seasonMetrics.classify(rf).rename(species +'_density_pred');
   
   
   var testingWithPred = finalBinary.addBands(pred).sampleRegions({
@@ -933,7 +1009,7 @@ var testWithPred = testingWithPred.filter(
 
   var testEval = testSample.map(function(f) {
     var obs = ee.Number(f.get(species));
-    var p = ee.Number(f.get('Oak_density_pred'));
+    var p = ee.Number(f.get(species +'_density_pred'));
     var diff = obs.subtract(p);
     return f.set('squared_error', diff.pow(2));
   });
@@ -944,22 +1020,22 @@ var testWithPred = testingWithPred.filter(
 });
 
 var resultsRegTreesFC = ee.FeatureCollection(resultsRegTrees);
-print('Regression tuning: nTrees', resultsRegTreesFC);
+//print('Regression tuning: nTrees', resultsRegTreesFC);
 
-var chartRegTrees = ui.Chart.feature.byFeature({
-  features: resultsRegTreesFC,
-  xProperty: 'nTrees',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Number of Trees',
-  hAxis: {title: 'Number of Trees'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['blue']
-});
-print(chartRegTrees);
+// var chartRegTrees = ui.Chart.feature.byFeature({
+//   features: resultsRegTreesFC,
+//   xProperty: 'nTrees',
+//   yProperties: ['RMSE']
+// }).setOptions({
+//   title: 'RF Regression: RMSE vs Number of Trees',
+//   hAxis: {title: 'Number of Trees'},
+//   vAxis: {title: 'RMSE (lower = better)'},
+//   colors: ['blue']
+// });
+// print(chartRegTrees);
 
 var bestRegTrees = resultsRegTreesFC.sort('RMSE').first().get('nTrees');
-print('Best nTrees (Regression):', bestRegTrees);
+//print('Best nTrees (Regression):', bestRegTrees);
 
 
 
@@ -984,7 +1060,7 @@ var resultsRegVars = varSplitList.map(function(vs) {
     inputProperties: seasonMetrics.bandNames()
   });
 
-  var pred = seasonMetrics.classify(rf).rename('Oak_density_pred');
+  var pred = seasonMetrics.classify(rf).rename(species +'_density_pred');
 
   var testingWithPred = finalBinary.addBands(pred).sampleRegions({
     collection: testingPoints,
@@ -1019,22 +1095,22 @@ var resultsRegVars = varSplitList.map(function(vs) {
 });
 
 var resultsRegVarsFC = ee.FeatureCollection(resultsRegVars);
-print('Regression tuning: variablesPerSplit', resultsRegVarsFC);
+//print('Regression tuning: variablesPerSplit', resultsRegVarsFC);
 
-var chartRegVars = ui.Chart.feature.byFeature({
-  features: resultsRegVarsFC,
-  xProperty: 'variablesPerSplit',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Variables per Split',
-  hAxis: {title: 'Variables per Split'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['red']
-});
-print(chartRegVars);
+// var chartRegVars = ui.Chart.feature.byFeature({
+//   features: resultsRegVarsFC,
+//   xProperty: 'variablesPerSplit',
+//   yProperties: ['RMSE']
+// }).setOptions({
+//   title: 'RF Regression: RMSE vs Variables per Split',
+//   hAxis: {title: 'Variables per Split'},
+//   vAxis: {title: 'RMSE (lower = better)'},
+//   colors: ['red']
+// });
+// print(chartRegVars);
 
 var bestRegVars = resultsRegVarsFC.sort('RMSE').first().get('variablesPerSplit');
-print('Best variablesPerSplit (Regression):', bestRegVars);
+//print('Best variablesPerSplit (Regression):', bestRegVars);
 
 
 // --------------------------------------
@@ -1093,22 +1169,22 @@ var resultsRegLeaf = minLeafList.map(function(ml) {
 });
 
 var resultsRegLeafFC = ee.FeatureCollection(resultsRegLeaf);
-print('Regression tuning: minLeafPopulation', resultsRegLeafFC);
+//print('Regression tuning: minLeafPopulation', resultsRegLeafFC);
 
-var chartRegLeaf = ui.Chart.feature.byFeature({
-  features: resultsRegLeafFC,
-  xProperty: 'minLeafPopulation',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Min Leaf Population',
-  hAxis: {title: 'Min Leaf Population'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['orange']
-});
-print(chartRegLeaf);
+// var chartRegLeaf = ui.Chart.feature.byFeature({
+//   features: resultsRegLeafFC,
+//   xProperty: 'minLeafPopulation',
+//   yProperties: ['RMSE']
+// }).setOptions({
+//   title: 'RF Regression: RMSE vs Min Leaf Population',
+//   hAxis: {title: 'Min Leaf Population'},
+//   vAxis: {title: 'RMSE (lower = better)'},
+//   colors: ['orange']
+// });
+// print(chartRegLeaf);
 
 var bestRegLeaf = resultsRegLeafFC.sort('RMSE').first().get('minLeafPopulation');
-print('Best minLeafPopulation (Regression):', bestRegLeaf);
+//print('Best minLeafPopulation (Regression):', bestRegLeaf);
 
 
 // --------------------------------------
@@ -1167,22 +1243,22 @@ var resultsRegBag = bagList.map(function(bf) {
 });
 
 var resultsRegBagFC = ee.FeatureCollection(resultsRegBag);
-print('Regression tuning: bagFraction', resultsRegBagFC);
+//print('Regression tuning: bagFraction', resultsRegBagFC);
 
-var chartRegBag = ui.Chart.feature.byFeature({
-  features: resultsRegBagFC,
-  xProperty: 'bagFraction',
-  yProperties: ['RMSE']
-}).setOptions({
-  title: 'RF Regression: RMSE vs Bag Fraction',
-  hAxis: {title: 'Bag Fraction'},
-  vAxis: {title: 'RMSE (lower = better)'},
-  colors: ['green']
-});
-print(chartRegBag);
+// var chartRegBag = ui.Chart.feature.byFeature({
+//   features: resultsRegBagFC,
+//   xProperty: 'bagFraction',
+//   yProperties: ['RMSE']
+// }).setOptions({
+//   title: 'RF Regression: RMSE vs Bag Fraction',
+//   hAxis: {title: 'Bag Fraction'},
+//   vAxis: {title: 'RMSE (lower = better)'},
+//   colors: ['green']
+// });
+// print(chartRegBag);
 
 var bestRegBag = resultsRegBagFC.sort('RMSE').first().get('bagFraction');
-print('Best bagFraction (Regression):', bestRegBag);
+//print('Best bagFraction (Regression):', bestRegBag);
 
 
 // --------------------------------------
@@ -1215,6 +1291,17 @@ Map.addLayer(
   species + ' Final Predicted Density (Optimized)'
 );
 
+Export.image.toDrive({
+  image: oakDensityMaskedFinal,
+  description: species + '_Final_Predicted_Density_Optimized',
+  folder: 'GEE_Exports', // Change this to your desired Drive folder name
+  fileNamePrefix: species + '_Final_Predicted_Density_Optimized',
+  region: oakDensityMaskedFinal.geometry(), // or use your study area geometry
+  scale: 30, // adjust depending on your dataset’s resolution
+  maxPixels: 1e13
+});
+
+
 // --------------------------------------
 // Evaluate on testing data
 // --------------------------------------
@@ -1244,111 +1331,17 @@ var testEvalFinal = testWithPredFinal.map(function(f) {
 var mseFinal = testEvalFinal.aggregate_mean('squared_error');
 var rmseFinal = ee.Algorithms.If(mseFinal, ee.Number(mseFinal).sqrt(), ee.Number(0));
 
-print('=== FINAL OPTIMIZED RF REGRESSION RESULTS ===');
-print('Best parameters:');
-print('  Trees:', bestRegTrees);
-print('  Vars per Split:', bestRegVars);
-print('  Min Leaf:', bestRegLeaf);
-print('  Bag Fraction:', bestRegBag);
+print(species + '=== FINAL OPTIMIZED RF REGRESSION RESULTS ===');
+//print('Best parameters:');
+//print('  Trees:', bestRegTrees);
+//print('  Vars per Split:', bestRegVars);
+//print('  Min Leaf:', bestRegLeaf);
+//print('  Bag Fraction:', bestRegBag);
 print('Final RMSE:', rmseFinal);
 
-/////////////////////////////////////////////////////
 
 
-// // 3️⃣ Train Random Forest Regression
-// var rfReg = ee.Classifier.smileRandomForest({
-//   numberOfTrees: 100,
-//   variablesPerSplit: 5,
-//   minLeafPopulation: 1,
-//   bagFraction: 0.9
-// })
-// .setOutputMode('REGRESSION')
-// .train({
-//   features: regPoints,
-//   classProperty: species,   // numeric density value
-//   inputProperties: seasonMetrics.bandNames()
-// });
-
-// // 4️⃣ Apply regression model only to pixels predicted as present
-// var oakDensityPred = seasonMetrics.classify(rfReg)
-//   .rename('Oak_density_pred');
-
-// // Use the binary mask to show density only where oak is present
-// //var oakPresenceMask = probPresence.gt(0.5); // Ensure this is defined
-// var oakDensityMasked = oakDensityPred.updateMask(finalBinary);
-
-// // 5️⃣ Visualize
-// Map.addLayer(
-//   oakDensityMasked,
-//   {min: 0, max: 1, palette: ['lightyellow', 'darkgreen']},
-//   species + ' Predicted Density (presence only)'
-// );
-
-// // // Export to Google Drive
-// // Export.image.toDrive({
-// //   image: oakDensityMasked,                   // your image object
-// //   description: species + '_Predicted_Density', // name of the task
-// //   folder: 'BBOW/EE/RASTERS',                      // optional: Drive folder name
-// //   fileNamePrefix: species + '_Predicted_Density', // output file name
-// //   scale: 30,                                  // pixel resolution (match your data)
-// //   region: oakDensityMasked.geometry(),        // export region
-// //   crs: 'EPSG:4326',                           // coordinate reference system
-// //   maxPixels: 1e13,                            // to allow large exports
-// //   region: geometry 
-// // });
-
-// //   //////////////////////////////////////////////
-
-
-// var testingWithPred = finalBinary.addBands(oakDensityPred).sampleRegions({
-//   collection: testingPoints,
-//   scale: 30,
-//   geometries: true
-// });
-
-
-// // 2️⃣ Filter to only oak presence (from binary map)
-// var testWithPred = testingWithPred.filter(
-//   ee.Filter.eq(species + '_binary_final', 1));
-
-
-// // 3️⃣ Compute residuals and squared error
-// // Only keep points with non-null predicted density
-// var testEval = testWithPred.filter(ee.Filter.notNull(['Oak_binary_final'])).map(function(f) {
-//   var obs = ee.Number(f.get(species));
-//   var pred = ee.Number(f.get('Oak_density_pred'));
-//   var diff = obs.subtract(pred);
-//   return f.set({
-//     residual: diff,
-//     squared_error: diff.pow(2)
-//   });
-// });
-
-// // Compute RMSE safely
-// var mse = testEval.aggregate_mean('squared_error');
-// var rmse = ee.Algorithms.If(mse, ee.Number(mse).sqrt(), ee.Number(0));
-// print('RMSE (' + species + ' regression):', rmse);
-
-
-
-// // 6️⃣ Chart: Predicted vs Observed
-// var chart = ui.Chart.feature.byFeature({
-//   features: testEval,
-//   xProperty: species,
-//   yProperties: ['Oak_density_pred']
-// })
-// .setChartType('ScatterChart')
-// .setOptions({
-//   title: species + ' Predicted vs Observed Oak Density',
-//   hAxis: {title: 'Observed Oak Density'},
-//   vAxis: {title: 'Predicted Oak Density'},
-//   pointSize: 4,
-//   trendlines: {0: {showR2: true, visibleInLegend: true}} // adds regression line
-// });
-
-// print(chart);
-
-
+//End of loop
  });
 
 
