@@ -1,0 +1,436 @@
+---
+title: "Spread_Simulations"
+author: "Ryan Pienaar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+
+library(terra)
+library(leaflet)
+library(tmap)
+library(tidyverse)
+library(gganimate)
+library(raster)
+library(shiny)
+library(shinyjs)
+library(khroma)
+library(gganimate)
+library(sf)
+
+```
+
+```{r}
+
+denspath <- "Z:/BBOW/Results/Maps/Regression/Oak_Density.tif"
+park <- vect("Y:/rpienaar/Apostle Islands/Map/Apostle_Islands_Map/Admin_Shapefiles/Apostle Islands National Lakeshore.shp")
+camps <- read.csv("nps_boundary/Campsites.csv")
+directions <- 8                      # 8 for Moore, 4 for rook
+
+# Load raster
+oakdens <- rast(denspath)
+
+# select a campsite
+camps_sub <- camps |> unite("Location", Island, Site.., sep = " - ", remove = FALSE)
+
+testcamp <- camps_sub |> filter(Location=="Oak - 2")
+
+start_pt <- vect(testcamp, geom = c("Longitude", "Latitude"), crs = crs(oakdens))
+```
+
+Map Oak density and show campsite locations
+
+```{r}
+# Create color palette
+pal <- colorNumeric(
+  palette = rev(as.vector(colour("bamako")(100))),  # reverse color order
+  domain  = values(oakdens),
+  na.color = "transparent"
+)
+
+pal_colors <- rev(as.vector(colour("bamako")(100)))
+
+# Create leaflet map
+m <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%  # nicer basemap
+  #addTiles() %>%
+  addRasterImage(oakdens, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(oakdens), title = "Predicted Oak Density") %>%
+  addCircleMarkers(
+    data = camps,
+    lng = ~Longitude,
+    lat = ~Latitude,
+    radius = 2,
+    color = "black",
+    fillColor = "yellow",
+    fillOpacity = 0.8,
+    popup = ~paste("Campsite:", ifelse("Name" %in% names(camps), Name, "Unknown"))
+  )
+
+# Show map
+m
+
+# Create the static map for publication
+
+camps <- camps |> filter(Island != "Outer")
+
+camps_sf <- st_as_sf(
+  camps,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326   # WGS84
+)
+
+tmap_mode("plot")   # interactive mode, like leaflet
+
+# If `oakdens` is a terra raster, convert to SpatRaster → stars/sf-like object:
+oakdens_r <- oakdens
+class(oakdens_r)
+# Create the map
+oak_map <- tm_basemap("CartoDB.PositronNoLabels") +
+
+  # Raster layer
+  tm_shape(oakdens_r) +
+  tm_raster(
+    palette = pal_colors,
+    title = "Predicted Oak Density"
+  ) +
+
+  # Campsite points
+  tm_shape(camps_sf) +
+  tm_symbols(
+    shape = 21,
+    col = "purple",
+    size = 0.5,
+    fill_alpha = 0.8,
+    #popup = "Name"   # automatically uses the Name column
+  ) +
+   # Add legend entry for campsites
+  tm_add_legend(
+    type = "symbol",
+    labels = "Campsites",
+    col = "purple",
+    shape = 21,
+    size = 0.5
+  ) +
+
+  # Legend options (optional)
+  tm_layout(
+    legend.outside = FALSE,
+  legend.position = c("right", "bottom"),
+  legend.just = c("right", "bottom"),
+  fontfamily = "serif"
+  )
+
+oak_map
+
+tmap_save(
+  tm = oak_map,             # saves the most recent tmap object
+  filename = "Results/oak_density_map.png",
+  width = 2000, height = 2000, # pixels (optional)
+  dpi = 300                     # high resolution
+)
+
+```
+
+
+Format the starting point
+
+```{r}
+
+# get the starting cell (closest raster cell to campsite point)
+start_xy <- crds(start_pt)           # matrix of coordinates (1 row if single)
+start_cell <- cellFromXY(oakdens, start_xy)
+
+# ensure NAs remain as NA
+names(oakdens) <- "density"
+
+ncell_tot <- ncell(oakdens)
+cells_idx <- seq_len(ncell_tot)
+dens_vals <- values(oakdens)%>% replace(is.na(.), 0)
+
+```
+
+
+Create matrix of pixel pairs to estimate transmission
+This out put is 2 column matrix that shows every pixel paired with every pixel it touches
+
+```{r}
+
+# --- Precompute adjacency pairs (both directions) ---
+# adjacent(..., pairs=TRUE) returns unique neighbor pairs (i,j), likely i<j; we want directed transmission so duplicate both directions
+adj_pairs <- adjacent(oakdens, cells = cells_idx, directions = directions, pairs = TRUE)
+# ensure it's a matrix (terra returns two-column matrix)
+adj_pairs <- as.matrix(adj_pairs)
+# duplicate to get directed edges both ways
+adj_pairs_dir <- rbind(adj_pairs, adj_pairs[, c(2,1)])
+colnames(adj_pairs_dir) <- c("from", "to")
+
+```
+
+
+Simulation function
+
+```{r}
+# Oak wilt spread simulation (terra) — using `oakdens` as the SpatRaster template
+library(terra)
+
+
+# --- Simulation function using oakdens ---
+run_single_sim <- function(oakdens, dens_vals, adj_pairs_dir, start_cell, max_steps = 100) {
+  # checks
+  if (missing(oakdens) || !inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
+  if (is.na(start_cell) || start_cell < 1 || start_cell > ncell(oakdens)) {
+    stop("start_cell is NA or out of range")
+  }
+  if (length(dens_vals) != ncell(oakdens)) {
+    stop("length(dens_vals) must equal number of cells in oakdens")
+  }
+
+  infected <- rep(0L, length(dens_vals)) # Set all cells to ) integers
+  infected[start_cell] <- 1L # Set start cell to 1
+  infected[is.na(dens_vals)] <- NA_integer_  # keeps NAs NA
+
+  # store history: t0 initial state
+  history <- list()
+  r0 <- rast(oakdens)         # copy template
+  values(r0) <- infected
+  names(r0) <- "t0"
+  history[[1]] <- r0
+
+  step <- 1L
+  while (step <= max_steps) {
+    # indices of currently infected (non-NA)
+    current_inf_idx <- which(infected == 1L)
+    if (length(current_inf_idx) == 0) break
+
+    # candidate directed adjacency rows: from infected -> to uninfected (and not NA)
+    valid_to_mask <- (infected == 0L)
+    rows_mask <- (infected[adj_pairs_dir[,1]] == 1L) & (valid_to_mask[adj_pairs_dir[,2]])
+    if (!any(rows_mask, na.rm = TRUE)) break
+
+    pairs_sub <- adj_pairs_dir[rows_mask, , drop = FALSE]
+    from_idx <- pairs_sub[,1]
+    to_idx <- pairs_sub[,2]
+
+    # per-link infection probability p_kj = (density_from + density_to) / 2
+    p_kj <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+    p_kj[is.na(p_kj)] <- 0
+    p_kj <- pmin(pmax(p_kj, 0), 1)
+
+    # combine multiple incoming probabilities for same 'to' cell:
+    # p_total = 1 - prod(1 - p_kj)
+    one_minus_p <- 1 - p_kj
+    prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+    to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
+    p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
+
+    # stochastic draws
+    draws <- runif(length(to_cells_unique))
+    newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+
+    if (length(newly_infected_idx) == 0) break
+
+    infected[newly_infected_idx] <- 1L
+
+    # store raster for this step
+    rstep <- rast(oakdens)
+    values(rstep) <- infected
+    names(rstep) <- paste0("t", step)
+    history[[length(history) + 1]] <- rstep
+
+    step <- step + 1L
+  }
+
+  final_r <- rast(oakdens)
+  values(final_r) <- infected
+  names(final_r) <- "final"
+
+  return(list(history = history, final = final_r))
+}
+
+
+sim1 <- run_single_sim(oakdens = oakdens,
+                       dens_vals = dens_vals,
+                       adj_pairs_dir = adj_pairs_dir,
+                       start_cell = start_cell,
+                       max_steps = 100)
+
+
+
+```
+
+Plot the infection simulation
+
+```{r}
+library(sf)
+library(terra)
+library(tmap)
+
+
+# Convert to sf
+camps_sf <- st_as_sf(
+  camps,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326   # WGS84
+)
+
+# Reproject to oakdens CRS so tmap layers align
+oak_crs <- crs(oakdens)            # terra::crs returns proj4/WKT string acceptable to sf
+if (is.na(oak_crs) || oak_crs == "") {
+  warning("oakdens has no CRS. Points kept in their original CRS.")
+} else {
+  camps_sf <- st_transform(camps_sf, crs = oak_crs)
+}
+
+# Now build the map (uses your style; adjust palette etc. as desired)
+# ensure pal_colors exists
+if (!exists("pal_colors")) pal_colors <- rev(terrain.colors(7))
+
+# Prepare infection layer (from sim1$final)
+inf_r <- sim1$final
+vals <- values(inf_r)
+vals[!is.na(vals) & vals == 0] <- NA
+values(inf_r) <- vals
+
+oak_map <- tm_basemap("CartoDB.PositronNoLabels") +
+
+  tm_shape(oakdens) +
+  tm_raster(
+    palette = pal_colors,
+    title = "Predicted Oak Density"
+  ) +
+
+  tm_shape(inf_r) +
+  tm_raster(
+    palette = "Reds",
+    title = "Infected (final)",
+    alpha = 0.6,
+    style = "cat"
+  ) +
+
+  tm_shape(camps_sf) +
+  tm_symbols(
+    shape = 21,
+    col = "purple",
+    size = 0.5,
+    fill.alpha = 0.8
+  ) +
+
+  tm_add_legend(
+    type = "symbol",
+    labels = "Campsites",
+    col = "purple",
+    shape = 21,
+    size = 0.5
+  ) +
+
+  tm_layout(
+    legend.outside = FALSE,
+    legend.position = c("right", "bottom"),
+    legend.just = c("right", "bottom"),
+    fontfamily = "serif"
+  )
+
+tmap_mode("plot")
+oak_map
+
+```
+
+```{r}
+
+# prepare infection raster (sim1$final from run_single_sim)
+inf_r <- sim1$final
+
+# set uninfected (0) -> NA so they are transparent on the overlay
+inf_vals <- values(inf_r)
+inf_vals[!is.na(inf_vals) & inf_vals == 0] <- NA
+values(inf_r) <- inf_vals
+
+# convert to raster::RasterLayer for addRasterImage if it's a terra SpatRaster
+if (inherits(inf_r, "SpatRaster")) {
+  inf_r_raster <- raster::raster(inf_r)
+} else if (inherits(inf_r, "RasterLayer")) {
+  inf_r_raster <- inf_r
+} else {
+  stop("sim1$final must be a SpatRaster or RasterLayer")
+}
+
+# count infected cells (for legend label)
+infected_count <- sum(values(inf_r_raster) == 1, na.rm = TRUE)
+
+# color function for infection overlay (red)
+inf_pal <- colorNumeric(palette = "Reds", domain = c(0,1), na.color = "transparent")
+
+# build map adding the infection layer and a legend entry
+m <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addRasterImage(oakdens, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(oakdens), title = "Predicted Oak Density") %>%
+
+  # infection overlay (semi-transparent red)
+  addRasterImage(inf_r_raster, colors = inf_pal, opacity = 0.6, group = "Infected") %>%
+
+  # campsites (your df)
+  addCircleMarkers(
+    data = camps,
+    lng = ~Longitude,
+    lat = ~Latitude,
+    radius = 2,
+    color = "black",
+    fillColor = "yellow",
+    fillOpacity = 0.8,
+    popup = ~paste("Campsite:", ifelse("Name" %in% names(camps), Name, "Unknown"))
+  ) %>%
+
+  # simple legend for infected
+  addLegend(colors = "red",
+            labels = paste0("Infected (", infected_count, ")"),
+            title = "Oak Wilt",
+            position = "bottomleft")
+
+# Show map
+m
+
+```
+
+
+Plot the time series
+
+```{r}
+
+# compute infected counts from sim1$history (list of SpatRasters t0, t1, ...)
+counts <- sapply(sim1$history, function(r) {
+  v <- values(r)
+  sum(v == 1, na.rm = TRUE)   # ignore NA cells
+})
+
+years <- 0:(length(counts) - 1)   # year 0 = initial state, year 1 = after 1 timestep, etc.
+
+library(ggplot2)
+
+df <- data.frame(
+  year = years,
+  cumulative = counts,
+  new = c(NA, diff(counts))
+)
+
+# cumulative plot
+ggplot(df, aes(x = year, y = cumulative)) +
+  geom_line(color = "darkred", size = 1) +
+  geom_point(color = "darkred") +
+  labs(title = "Oak wilt: cumulative infected cells", x = "Year", y = "Infected cells") +
+  theme_minimal()
+
+# new infections (incidence) bar plot
+ggplot(df[-1, ], aes(x = year, y = new)) +   # drop year 0 (NA)
+  geom_col(fill = "steelblue") +
+  labs(title = "New infected cells per year", x = "Year", y = "New infections") +
+  theme_minimal()
+
+```
+
+
+
+
+
