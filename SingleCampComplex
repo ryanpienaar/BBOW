@@ -5,12 +5,6 @@ date: "`r Sys.Date()`"
 output: html_document
 ---
 
-# This is the simulation function that includes the effects of oak density, soil type, and slope on the likelihood of oak wilt transmission from one cell to another cell. 
-# Additionally it includes a random insect transmision function that allows the disease to spread over distances to new infection centres with decreasing probability the further you get from an infected cell
-# The results display numbe of cells infected over time 
-
-
-
 ```{r}
 
 library(terra)
@@ -846,6 +840,11 @@ Add a random insect vector function
 ```{r}
 
 
+# run_single_sim with per-step and cumulative breakdown of local (ground) vs jump infections
+# Returns: list(history, final, counts)
+# counts columns: step, new_local, new_jump, new_total, cum_local, cum_jump, cum_total
+library(terra)
+
 run_single_sim <- function(oakdens,
                            dens_vals,
                            dem,                # SpatRaster DEM aligned with oakdens
@@ -861,7 +860,9 @@ run_single_sim <- function(oakdens,
                            jump_radius = 600,
                            jump_beta = 0.01,
                            # new density effect param
-                           density_power = 1.0
+                           density_power = 1.0,
+                           # verbosity: print per-step summaries
+                           verbose = TRUE
 ) {
   soil_effect <- match.arg(soil_effect)
   if (!inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
@@ -898,10 +899,22 @@ run_single_sim <- function(oakdens,
   history <- list()
   r0 <- rast(oakdens); values(r0) <- infected; names(r0) <- "t0"; history[[1]] <- r0
 
+  # counters: per-step and cumulative for local (ground) and jump
+  new_local_vec <- integer(0)
+  new_jump_vec  <- integer(0)
+  cum_local     <- 0L   # count of infections attributed to local spread (excl. initial seed)
+  cum_jump      <- 0L   # count of infections attributed to jump events
+  # Treat initial seed as ground-introduced? If you prefer otherwise, change below:
+  # We'll NOT count the initial seed in cum_local/cum_jump; counts start from spread events.
+  # If you want to include the seed as local, set cum_local <- 1L here.
+
   step <- 1L
   while (step <= max_steps) {
     current_inf_idx <- which(infected == 1L)
     if (length(current_inf_idx) == 0) break
+
+    local_new <- 0L
+    jump_new  <- 0L
 
     # --------------------
     # Local neighbourhood spread
@@ -915,23 +928,22 @@ run_single_sim <- function(oakdens,
       # Restrict to targets with oak density > 0 (otherwise skip)
       keep_mask <- (dens_vals[to_idx] > 0)
       if (any(keep_mask, na.rm = TRUE)) {
-        from_idx <- from_idx[keep_mask]
-        to_idx   <- to_idx[keep_mask]
+        from_idx2 <- from_idx[keep_mask]
+        to_idx2   <- to_idx[keep_mask]
 
-        # density component (average) and ensure zero where density is zero
-        p_density <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+        # density component (average)
+        p_density <- (dens_vals[from_idx2] + dens_vals[to_idx2]) / 2
         p_density[is.na(p_density)] <- 0
 
         # apply additional density dependence using target density
-        # dens_power of 0 => no extra effect; 1 => multiply by target density; >1 favour high-density more
         if (!is.null(density_power) && density_power != 0) {
-          tp <- dens_vals[to_idx]
+          tp <- dens_vals[to_idx2]
           tp[is.na(tp)] <- 0
           p_density <- p_density * (tp ^ density_power)
         }
 
         # elevation multiplier
-        abs_diff <- abs(dem_vals[from_idx] - dem_vals[to_idx])
+        abs_diff <- abs(dem_vals[from_idx2] - dem_vals[to_idx2])
         abs_diff_is_na <- is.na(abs_diff)
         abs_diff[abs_diff_is_na] <- 0
         slope_mult <- slope_fun(abs_diff)
@@ -939,11 +951,11 @@ run_single_sim <- function(oakdens,
 
         # soil multiplier acc. to choice
         if (soil_effect == "to") {
-          s_mult <- soil_vec[to_idx]
+          s_mult <- soil_vec[to_idx2]
         } else if (soil_effect == "from") {
-          s_mult <- soil_vec[from_idx]
+          s_mult <- soil_vec[from_idx2]
         } else {
-          s_mult <- (soil_vec[from_idx] + soil_vec[to_idx]) / 2
+          s_mult <- (soil_vec[from_idx2] + soil_vec[to_idx2]) / 2
         }
         s_mult[is.na(s_mult)] <- 1
 
@@ -954,52 +966,95 @@ run_single_sim <- function(oakdens,
 
         # aggregate incoming probabilities
         one_minus_p <- 1 - p_kj
-        prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+        prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx2, FUN = prod)
         to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
         p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
 
         # stochastic draws
-        draws <- runif(length(to_cells_unique))
-        newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
-        if (length(newly_infected_idx) > 0) infected[newly_infected_idx] <- 1L
+        if (length(p_total_by_to) > 0) {
+          draws <- runif(length(to_cells_unique))
+          newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+          if (length(newly_infected_idx) > 0) {
+            infected[newly_infected_idx] <- 1L
+            local_new <- as.integer(length(newly_infected_idx))
+            cum_local <- cum_local + local_new
+          }
+        }
       }
     }
 
+    jump_counts <- c(0L, 1L, 2L, 5L)
+    jump_probs  <- c(0.50, 0.25, 0.125, 0.125)
+
+    n_jumps <- sample(jump_counts, size = 1, prob = jump_probs)
     # --------------------
     # Jump infection (one per timestep)
     # restrict jump candidates to cells with dens_vals > 0 and weight by density
     # --------------------
-    if (jump_enabled && length(which(infected == 1L)) > 0) {
-      src_r <- rast(oakdens)
-      vals_src <- rep(NA_real_, ncell(oakdens))
-      vals_src[infected == 1L] <- 1
-      values(src_r) <- vals_src
+   jump_new <- 0L
 
-      dist_r <- distance(src_r)
-      dist_vals <- values(dist_r)
+if (jump_enabled && n_jumps > 0 && any(infected == 1L)) {
 
-      # candidate uninfected cells within radius and with oak density > 0
-      cand_idx <- which(infected == 0L & !is.na(dist_vals) & dist_vals <= jump_radius & dens_vals > 0)
-      if (length(cand_idx) > 0) {
-        d_cand <- dist_vals[cand_idx]
-        # distance weight
-        w_dist <- exp(-jump_beta * d_cand)
-        # density weight (target)
-        if (!is.null(density_power) && density_power != 0) {
-          w_dens <- (dens_vals[cand_idx] ^ density_power)
-        } else {
-          w_dens <- rep(1, length(cand_idx))
-        }
-        w <- w_dist * w_dens
-        w[is.na(w) | w < 0] <- 0
-        if (sum(w) > 0) {
-          sel <- sample(cand_idx, size = 1, prob = w)
-          infected[sel] <- 1L
-        }
-      }
+  for (j in seq_len(n_jumps)) {
+
+    # source raster: currently infected cells
+    src_r <- rast(oakdens)
+    vals_src <- rep(NA_real_, ncell(oakdens))
+    vals_src[infected == 1L] <- 1
+    values(src_r) <- vals_src
+
+    # distance to nearest infected
+    dist_r <- distance(src_r)
+    dist_vals <- values(dist_r)
+
+    # candidate targets
+    cand_idx <- which(
+      infected == 0L &
+      !is.na(dist_vals) &
+      dist_vals <= jump_radius &
+      dens_vals > 0
+    )
+
+    if (length(cand_idx) == 0) break
+
+    # weights
+    d_cand <- dist_vals[cand_idx]
+    w_dist <- exp(-jump_beta * d_cand)
+
+    if (!is.null(density_power) && density_power != 0) {
+      w_dens <- dens_vals[cand_idx] ^ density_power
+    } else {
+      w_dens <- rep(1, length(cand_idx))
     }
 
-    # save step
+    w <- w_dist * w_dens
+    w[is.na(w) | w < 0] <- 0
+
+    if (sum(w) == 0) break
+
+    # draw jump target
+    sel <- sample(cand_idx, size = 1, prob = w)
+
+    infected[sel] <- 1L
+    jump_new  <- jump_new + 1L
+    cum_jump  <- cum_jump + 1L
+  }
+}
+
+    # total new this step
+    new_total <- local_new + jump_new
+    cum_total <- cum_local + cum_jump
+    # store per-step numbers
+    new_local_vec <- c(new_local_vec, local_new)
+    new_jump_vec  <- c(new_jump_vec, jump_new)
+
+    # verbose message
+    if (verbose) {
+      message(sprintf("Step %d: new_total=%d (local=%d, jump=%d) | cum_local=%d, cum_jump=%d, cum_total=%d",
+                      step, new_total, local_new, jump_new, cum_local, cum_jump, cum_total))
+    }
+
+    # save step raster
     rstep <- rast(oakdens); values(rstep) <- infected; names(rstep) <- paste0("t", step)
     history[[length(history) + 1]] <- rstep
 
@@ -1007,7 +1062,23 @@ run_single_sim <- function(oakdens,
   }
 
   final_r <- rast(oakdens); values(final_r) <- infected; names(final_r) <- "final"
-  return(list(history = history, final = final_r))
+
+  # Build counts dataframe
+  nsteps_recorded <- length(new_local_vec)
+  steps <- seq_len(nsteps_recorded)
+  cum_local_vec <- cumsum(new_local_vec)
+  cum_jump_vec  <- cumsum(new_jump_vec)
+  counts_df <- data.frame(
+    step = steps,
+    new_local = new_local_vec,
+    new_jump = new_jump_vec,
+    new_total = new_local_vec + new_jump_vec,
+    cum_local = cum_local_vec,
+    cum_jump = cum_jump_vec,
+    cum_total = cum_local_vec + cum_jump_vec
+  )
+
+  return(list(history = history, final = final_r, counts = counts_df))
 }
 
 sim1 <- run_single_sim(
@@ -1017,12 +1088,13 @@ sim1 <- run_single_sim(
   soil_mult = soil_raster,       # SpatRaster or vector
   adj_pairs_dir = adj_pairs_dir,
   start_cell = start_cell,
-  max_steps = 100,
+  max_steps = 20,
   beta = log(2) / 50,           # elevation effect
   jump_enabled = TRUE,
   jump_radius = 600,             # metres (map units)
-  jump_beta = 0.025,       # half-weight at 200 m (example)
-      
+  jump_beta = 0.005,       # half-weight at 200 m (example)
+  verbose = TRUE,
+  density_power = 1.5
 )
 
 ```
@@ -1267,14 +1339,18 @@ for (i in 1:nlyr(hist_stack2)) {
 
 # animate(composite, pause = 0.5, col = c(terrain.colors(100), "red"),   legend = FALSE)
 
-suppressWarnings(
-  save_gif(
-    animate(composite, pause = 0.5, col = c(terrain.colors(100), "red"), legend = FALSE),
-    gif_file = "animations/Oak_Spread.gif"
-  )
-)
+# suppressWarnings(
+#   save_gif(
+#     animate(composite, pause = 0.5, col = c(terrain.colors(100), "red"), legend = FALSE),
+#     gif_file = "animations/Oak_Spread.gif"
+#   )
+# )
 
 ```
+
+
+
+
 
 
 
