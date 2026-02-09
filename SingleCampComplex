@@ -1,0 +1,1289 @@
+---
+title: "Spread_Simulations"
+author: "Ryan Pienaar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# This is the simulation function that includes the effects of oak density, soil type, and slope on the likelihood of oak wilt transmission from one cell to another cell. 
+# Additionally it includes a random insect transmision function that allows the disease to spread over distances to new infection centres with decreasing probability the further you get from an infected cell
+# The results display numbe of cells infected over time 
+
+
+
+```{r}
+
+library(terra)
+library(leaflet)
+library(tmap)
+library(tidyverse)
+library(gganimate)
+library(raster)
+library(shiny)
+library(shinyjs)
+library(khroma)
+library(gganimate)
+library(sf)
+library(gifski)
+
+```
+
+```{r}
+
+denspath <- "Z:/BBOW/Results/Maps/Regression/Oak_Density.tif"
+park <- vect("Y:/rpienaar/Apostle Islands/Map/Apostle_Islands_Map/Admin_Shapefiles/Apostle Islands National Lakeshore.shp")
+camps <- read.csv("nps_boundary/Campsites.csv")
+dempath <- "Y:/rpienaar/Apostle Islands/Map/DEM_Apostle_Islands_30m.tif"
+directions <- 8                      # 8 for Moore, 4 for rook
+
+# Load raster
+oakdens <- rast(denspath)
+dem <- rast(dempath)
+
+
+
+# select a campsite
+camps_sub <- camps |> unite("Location", Island, Site.., sep = " - ", remove = FALSE)
+
+testcamp <- camps_sub |> filter(Location=="Oak - 2")
+
+start_pt <- vect(testcamp, geom = c("Longitude", "Latitude"), crs = crs(oakdens))
+
+```
+
+Map Oak density and show campsite locations
+
+```{r}
+# Create color palette
+pal <- colorNumeric(
+  palette = rev(as.vector(colour("bamako")(100))),  # reverse color order
+  domain  = values(oakdens),
+  na.color = "transparent"
+)
+
+pal_colors <- rev(as.vector(colour("bamako")(100)))
+
+# Create leaflet map
+m <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%  # nicer basemap
+  #addTiles() %>%
+  addRasterImage(oakdens, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(oakdens), title = "Predicted Oak Density") %>%
+  addCircleMarkers(
+    data = camps,
+    lng = ~Longitude,
+    lat = ~Latitude,
+    radius = 2,
+    color = "black",
+    fillColor = "yellow",
+    fillOpacity = 0.8,
+    popup = ~paste("Campsite:", ifelse("Name" %in% names(camps), Name, "Unknown"))
+  )
+
+# Show map
+m
+
+# Create the static map for publication
+
+camps <- camps |> filter(Island != "Outer")
+
+camps_sf <- st_as_sf(
+  camps,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326   # WGS84
+)
+
+tmap_mode("plot")   # interactive mode, like leaflet
+
+# If `oakdens` is a terra raster, convert to SpatRaster → stars/sf-like object:
+oakdens_r <- oakdens
+class(oakdens_r)
+# Create the map
+oak_map <- tm_basemap("CartoDB.PositronNoLabels") +
+
+  # Raster layer
+  tm_shape(oakdens_r) +
+  tm_raster(
+    palette = pal_colors,
+    title = "Predicted Oak Density"
+  ) +
+
+  # Campsite points
+  tm_shape(camps_sf) +
+  tm_symbols(
+    shape = 21,
+    col = "purple",
+    size = 0.5,
+    fill_alpha = 0.8,
+    #popup = "Name"   # automatically uses the Name column
+  ) +
+   # Add legend entry for campsites
+  tm_add_legend(
+    type = "symbol",
+    labels = "Campsites",
+    col = "purple",
+    shape = 21,
+    size = 0.5
+  ) +
+
+  # Legend options (optional)
+  tm_layout(
+    legend.outside = FALSE,
+  legend.position = c("right", "bottom"),
+  legend.just = c("right", "bottom"),
+  fontfamily = "serif"
+  )
+
+oak_map
+
+tmap_save(
+  tm = oak_map,             # saves the most recent tmap object
+  filename = "Results/oak_density_map.png",
+  width = 2000, height = 2000, # pixels (optional)
+  dpi = 300                     # high resolution
+)
+
+```
+
+Align raster
+
+```{r}
+
+# Align dem to the oakdens template
+# dem: SpatRaster DEM
+# oakdens: SpatRaster template you want to match
+# method: resampling method: "bilinear" (default) or "near"
+# filename: optional path to write the aligned raster to disk (terra will write on the fly)
+# overwrite: whether to overwrite filename
+align_dem_to_oakdens <- function(dem, oakdens, method = "bilinear", filename = "", overwrite = FALSE) {
+  if (!inherits(dem, "SpatRaster") || !inherits(oakdens, "SpatRaster")) {
+    stop("Both dem and oakdens must be terra SpatRaster objects")
+  }
+
+  # 1) Project DEM to oakdens CRS if needed
+  dem_crs <- crs(dem, proj = TRUE)
+  oak_crs <- crs(oakdens, proj = TRUE)
+  if (is.na(dem_crs) || dem_crs == "") {
+    warning("DEM has no CRS. Proceeding assuming it is already in the oakdens CRS.")
+    dem_proj <- dem
+  } else if (!identical(dem_crs, oak_crs)) {
+    message("Projecting DEM from its CRS to oakdens CRS (this may take time for large rasters)...")
+    dem_proj <- project(dem, oak_crs, method = method)
+  } else {
+    dem_proj <- dem
+  }
+
+  # 2) Resample DEM to match oakdens grid (extent, resolution, origin, rows/cols)
+  # Using oakdens as the 'y' argument will create a raster with the same geometry as oakdens
+  message("Resampling DEM to match oakdens resolution, extent and alignment...")
+  dem_aligned <- resample(dem_proj, oakdens, method = method, filename = filename, overwrite = overwrite)
+
+  return(dem_aligned)
+}
+
+# Example usage:
+dem <- align_dem_to_oakdens(dem = dem, oakdens = oakdens, method = "bilinear")
+
+```
+
+Rasterize soils shapefile to match oakdens grid
+
+```{r}
+
+soil_map <- st_read("Y:/rpienaar/Apostle Islands/Map/Soils/soil_map.shp")
+
+# Rasterize soil shapefile to oakdens grid and assign multipliers
+# - Fluvents  = 0.5
+# - Psamments = 1
+# - Udalfs    = 0.5
+# - hemists   = 1
+# - All others (and cells not covered by polygons) = 0.1
+#
+# Requires: terra, sf
+# Usage example:
+# soils_r <- rasterize_soils_to_oakdens("soils.shp", oakdens, class_col = "SOIL_CLASS")
+# soil_mult_vec <- values(soils_r)   # numeric vector aligned to oakdens cells
+
+rasterize_soils_to_oakdens <- function(soils_shp,
+                                       oakdens,
+                                       class_col = NULL,
+                                       mapping = NULL,
+                                       default_other = 0,
+                                       method = "near",        # rasterize numeric attribute -> 'near' is fine
+                                       filename = "",
+                                       overwrite = FALSE) {
+  # Input checks
+  if (!inherits(oakdens, "SpatRaster")) stop("oakdens must be a terra SpatRaster")
+  if (is.character(soils_shp)) {
+    if (!file.exists(soils_shp)) stop("soils_shp path does not exist: ", soils_shp)
+    soils_sf <- st_read(soils_shp, quiet = TRUE)
+  } else if (inherits(soils_shp, "sf")) {
+    soils_sf <- soils_shp
+  } else if (inherits(soils_shp, "SpatVector")) {
+    soils_sf <- st_as_sf(soils_shp)
+  } else {
+    stop("soils_shp must be a path to a shapefile, an sf, or a SpatVector")
+  }
+
+
+  # Ensure soils and oakdens share CRS: transform soils to oakdens CRS if needed
+  oak_crs <- crs(oakdens)
+  if (is.na(st_crs(soils_sf))) {
+    warning("Soils shapefile has no CRS. Assuming oakdens CRS.")
+    st_crs(soils_sf) <- oak_crs
+  } else {
+    # compare WKT/PROJ strings; transform if different
+    if (st_crs(soils_sf)$wkt != oak_crs) {
+      soils_sf <- st_transform(soils_sf, crs = oak_crs)
+    }
+  }
+
+  # Normalize soil class labels (lowercase, trimmed)
+  soils_sf$.soil_label <- tolower(trimws(as.character(soils_sf[[class_col]])))
+
+  # Default mapping if none supplied (keys must be lowercase)
+  if (is.null(mapping)) {
+    mapping <- c(
+      "fluvents"  = 0.75,
+      "psamments" = 1.0,
+      "udalfs"    = 0.5,
+      "hemists"   = 1.0,
+      "aquolls" = 0.5,
+      "udolls" = 0.5,
+      "aquetpts" = 0.5,
+      "sparists" = 0.5,
+      "udepts" = 0.5,
+      "aqalfs" = 0.5,
+      "aquents" = 0.5,
+      "orthods" = 0.5
+    )
+  } else {
+    # normalize mapping names to lowercase
+    names(mapping) <- tolower(names(mapping))
+  }
+
+  # Build numeric multiplier column: use mapping when matched, otherwise default_other
+  soils_sf$.mult <- default_other
+  # match and assign
+  matched_idx <- match(soils_sf$.soil_label, names(mapping))
+  has_match <- !is.na(matched_idx)
+  if (any(has_match)) {
+    soils_sf$.mult[has_match] <- as.numeric(mapping[matched_idx[has_match]])
+  }
+
+  # Convert to SpatVector for rasterize
+  soils_v <- terra::vect(soils_sf)
+
+  # Rasterize the numeric '.mult' field to oakdens geometry
+  # Using touches = TRUE so polygons touching a cell count
+  message("Rasterizing soils to oakdens grid (this will match extent/resolution/origin of oakdens)...")
+  soil_mult_r <- terra::rasterize(soils_v, oakdens, field = ".mult", touches = TRUE,
+                                  filename = filename, overwrite = overwrite)
+
+  # For cells not covered by polygons (NA), set to default_other so "all others = 0.1"
+  vals <- terra::values(soil_mult_r)
+  if (any(is.na(vals))) {
+    vals[is.na(vals)] <- default_other
+    terra::values(soil_mult_r) <- vals
+  }
+
+  message("Rasterization complete. Returning SpatRaster aligned to oakdens.")
+  return(soil_mult_r)
+}
+
+# Example (uncomment and adapt paths/objects):
+soils_shp <- "Y:/rpienaar/Apostle Islands/Map/Soils/soil_map.shp"
+soil_raster <- rasterize_soils_to_oakdens(soils_shp, oakdens, class_col = "txsbrdr")
+plot(soil_raster, main = "Soil multiplier (aligned to oakdens)")
+
+```
+
+
+
+Cropped starting point: Do this for just an island
+
+```{r}
+
+islands <- vect("Y:/rpienaar/Apostle Islands/Map/APIS_Islands_Ind.shp")
+
+
+oak_island <- islands[grepl("Oak", islands$NAME, ignore.case = TRUE), ]
+
+oak_island <- project(oak_island, crs(oakdens))
+
+dem    <- crop(dem, oak_island)
+oakdens  <- crop(oakdens, oak_island)
+soil     <- crop(soil_raster, oak_island)
+
+# get the starting cell (closest raster cell to campsite point)
+start_xy <- crds(start_pt)           # matrix of coordinates (1 row if single)
+start_cell <- cellFromXY(oakdens, start_xy)
+
+# ensure NAs remain as NA
+names(oakdens) <- "density"
+
+ncell_tot <- ncell(oakdens)
+cells_idx <- seq_len(ncell_tot)
+dens_vals <- values(oakdens)%>% replace(is.na(.), 0)
+
+start_cell
+
+```
+Do thhis for the whole archipelago
+
+```{r}
+
+# # get the starting cell (closest raster cell to campsite point)
+# start_xy <- crds(start_pt)           # matrix of coordinates (1 row if single)
+# start_cell <- cellFromXY(oakdens, start_xy)
+# 
+# # ensure NAs remain as NA
+# names(oakdens) <- "density"
+# 
+# ncell_tot <- ncell(oakdens)
+# cells_idx <- seq_len(ncell_tot)
+# dens_vals <- values(oakdens)%>% replace(is.na(.), 0)
+# 
+# start_cell
+
+```
+
+
+Create matrix of pixel pairs to estimate transmission
+This out put is 2 column matrix that shows every pixel paired with every pixel it touches
+
+```{r}
+
+# --- Precompute adjacency pairs (both directions) ---
+# adjacent(..., pairs=TRUE) returns unique neighbor pairs (i,j), likely i<j; we want directed transmission so duplicate both directions
+adj_pairs <- adjacent(oakdens, cells = cells_idx, directions = directions, pairs = TRUE)
+# ensure it's a matrix (terra returns two-column matrix)
+adj_pairs <- as.matrix(adj_pairs)
+# duplicate to get directed edges both ways
+adj_pairs_dir <- rbind(adj_pairs, adj_pairs[, c(2,1)])
+colnames(adj_pairs_dir) <- c("from", "to")
+
+```
+
+
+Crop my input rasters to only oak island
+
+```{r}
+
+
+
+tm_basemap("CartoDB.PositronNoLabels") +
+
+  # Raster layer
+  tm_shape(oakdens) +
+  tm_raster(
+    palette = pal_colors,
+    title = "Predicted Oak Density"
+  ) +
+
+  # Oak island boundary
+  tm_shape(oak_island) +
+  tm_borders(
+    col = "black",
+    lwd = 2
+  ) +
+
+  # Campsite points
+  tm_shape(camps_sf) +
+  tm_symbols(
+    shape = 21,
+    col = "purple",
+    size = 0.5,
+    fill_alpha = 0.8
+  ) +
+
+  # Legend entry for campsites
+  tm_add_legend(
+    type = "symbol",
+    labels = "Campsites",
+    col = "purple",
+    shape = 21,
+    size = 0.5
+  ) +
+
+  tm_layout(
+    legend.outside = FALSE,
+    legend.position = c("right", "top"),
+    legend.just = c("right", "top"),
+    fontfamily = "serif"
+  )
+
+```
+
+
+Simulation function Base
+
+```{r}
+
+# run_single_sim <- function(oakdens, dens_vals, adj_pairs_dir, start_cell, max_steps = 100) {
+#   # checks
+#   if (missing(oakdens) || !inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
+#   if (is.na(start_cell) || start_cell < 1 || start_cell > ncell(oakdens)) {
+#     stop("start_cell is NA or out of range")
+#   }
+#   if (length(dens_vals) != ncell(oakdens)) {
+#     stop("length(dens_vals) must equal number of cells in oakdens")
+#   }
+# 
+#   infected <- rep(0L, length(dens_vals)) # Set all cells to ) integers
+#   infected[start_cell] <- 1L # Set start cell to 1
+#   infected[is.na(dens_vals)] <- NA_integer_  # keeps NAs NA
+# 
+#   # store history: t0 initial state
+#   history <- list()
+#   r0 <- rast(oakdens)         # copy template
+#   values(r0) <- infected
+#   names(r0) <- "t0"
+#   history[[1]] <- r0
+# 
+#   step <- 1L
+#   while (step <= max_steps) {
+#     # indices of currently infected (non-NA)
+#     current_inf_idx <- which(infected == 1L)
+#     if (length(current_inf_idx) == 0) break
+# 
+#     # candidate directed adjacency rows: from infected -> to uninfected (and not NA)
+#     valid_to_mask <- (infected == 0L)
+#     rows_mask <- (infected[adj_pairs_dir[,1]] == 1L) & (valid_to_mask[adj_pairs_dir[,2]])
+#     if (!any(rows_mask, na.rm = TRUE)) break
+# 
+#     pairs_sub <- adj_pairs_dir[rows_mask, , drop = FALSE]
+#     from_idx <- pairs_sub[,1]
+#     to_idx <- pairs_sub[,2]
+# 
+#     # per-link infection probability p_kj = (density_from + density_to) / 2
+#     # density component for transmission probability
+#     p_kj <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+#     p_kj[is.na(p_kj)] <- 0
+# 
+#     # set to 0 if either source or target density is 0
+#     p_kj[dens_vals[from_idx] == 0 | dens_vals[to_idx] == 0] <- 0
+# 
+#     # guard to [0,1]
+#     p_kj <- pmin(pmax(p_kj, 0), 1)
+# 
+#     # combine multiple incoming probabilities for same 'to' cell:
+#     # p_total = 1 - prod(1 - p_kj)
+#     one_minus_p <- 1 - p_kj
+#     prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+#     to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
+#     p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
+# 
+#     # stochastic draws
+#     draws <- runif(length(to_cells_unique))
+#     newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+# 
+#     if (length(newly_infected_idx) == 0) break
+# 
+#     infected[newly_infected_idx] <- 1L
+# 
+#     # store raster for this step
+#     rstep <- rast(oakdens)
+#     values(rstep) <- infected
+#     names(rstep) <- paste0("t", step)
+#     history[[length(history) + 1]] <- rstep
+# 
+#     step <- step + 1L
+#   }
+# 
+#   final_r <- rast(oakdens)
+#   values(final_r) <- infected
+#   names(final_r) <- "final"
+# 
+#   return(list(history = history, final = final_r))
+# }
+# 
+# sim1 <- run_single_sim(oakdens = oakdens_crop,
+#                        dens_vals = dens_vals,
+#                        adj_pairs_dir = adj_pairs_dir,
+#                        start_cell = start_cell,
+#                        max_steps = 100)
+
+```
+
+Add slope
+
+```{r}
+
+
+# Updated simulation: multiplies transmission probability by soil multiplier raster/value
+#
+# Usage:
+# sim1 <- run_single_sim(
+#   oakdens = oakdens,
+#   dem = dem_aligned,
+#   dens_vals = dens_vals,
+#   soil_mult = soil_mult_r,          # SpatRaster OR numeric vector aligned to oakdens
+#   adj_pairs_dir = adj_pairs_dir,
+#   start_cell = start_cell,
+#   max_steps = 100,
+#   beta = 0.1,
+#   soil_effect = "to"                # "to" (default), "from", or "both"
+# )
+#
+
+# 
+# run_single_sim <- function(oakdens,
+#                            dens_vals,
+#                            dem,                # SpatRaster DEM aligned with oakdens (or will be checked)
+#                            soil_mult = NULL,   # either SpatRaster or numeric vector (multiplier per cell)
+#                            adj_pairs_dir,
+#                            start_cell,
+#                            max_steps = 100,
+#                            beta = 0.1,
+#                            slope_fun = NULL,
+#                            soil_effect = c("to", "from", "both")) {
+#   soil_effect <- match.arg(soil_effect)
+# 
+#   # basic checks
+#   if (!inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
+#   if (!inherits(dem, "SpatRaster")) stop("dem must be a SpatRaster")
+#   if (ncell(oakdens) != ncell(dem)) stop("oakdens and dem must have the same number of cells and alignment")
+#   if (length(dens_vals) != ncell(oakdens)) stop("length(dens_vals) must equal number of cells in oakdens")
+#   if (is.na(start_cell) || start_cell < 1 || start_cell > ncell(oakdens)) stop("start_cell is NA or out of range")
+#   if (is.null(slope_fun)) slope_fun <- function(abs_diff) exp(-beta * abs_diff)
+# 
+#   # prepare soil multiplier as numeric vector aligned to oakdens cells
+#   if (is.null(soil_mult)) {
+#     soil_vec <- rep(1, ncell(oakdens))
+#   } else if (inherits(soil_mult, "SpatRaster")) {
+#     # if it doesn't match geometry, resample to oakdens
+#     if (!compareGeom(soil_mult, oakdens, stopOnError = FALSE)) {
+#       message("Soil raster geometry differs from oakdens; resampling soil raster to oakdens grid (method = 'near')...")
+#       soil_mult <- resample(soil_mult, oakdens, method = "near")
+#     }
+#     soil_vec <- values(soil_mult)
+#   } else if (is.numeric(soil_mult) && length(soil_mult) == ncell(oakdens)) {
+#     soil_vec <- soil_mult
+#   } else {
+#     stop("soil_mult must be NULL, a SpatRaster, or a numeric vector of length ncell(oakdens)")
+#   }
+# 
+#   # replace NA soil multipliers with 1 (no effect) to avoid blocking transmission unless you want otherwise
+#   soil_vec[is.na(soil_vec)] <- 1
+# 
+#   # DEM values vector
+#   dem_vals <- values(dem)
+# 
+#   # initialize infection vector
+#   infected <- rep(0L, length(dens_vals))
+#   infected[start_cell] <- 1L
+#   infected[is.na(dens_vals)] <- NA_integer_
+#   infected[is.na(dem_vals)] <- NA_integer_  # ensure nodata in DEM block transmission
+#   infected[is.na(soil_vec)] <- NA_integer_
+# 
+#   # history store
+#   history <- list()
+#   r0 <- rast(oakdens)
+#   values(r0) <- infected
+#   names(r0) <- "t0"
+#   history[[1]] <- r0
+# 
+#   step <- 1L
+#   while (step <= max_steps) {
+#     current_inf_idx <- which(infected == 1L)
+#     if (length(current_inf_idx) == 0) break
+# 
+#     # candidates: from infected -> to uninfected
+#     valid_to_mask <- (infected == 0L)
+#     rows_mask <- (infected[adj_pairs_dir[,1]] == 1L) & (valid_to_mask[adj_pairs_dir[,2]])
+#     if (!any(rows_mask, na.rm = TRUE)) break
+# 
+#     pairs_sub <- adj_pairs_dir[rows_mask, , drop = FALSE]
+#     from_idx <- pairs_sub[,1]
+#     to_idx   <- pairs_sub[,2]
+# 
+#       # density component
+#       p_density <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+#        p_density[is.na(p_density)] <- 0
+#        p_density[dens_vals[from_idx] == 0 | dens_vals[to_idx] == 0] <- 0
+# 
+#     # elevation multiplier
+#     abs_diff <- abs(dem_vals[from_idx] - dem_vals[to_idx])
+#     abs_diff_is_na <- is.na(abs_diff)
+#     abs_diff[abs_diff_is_na] <- 0
+#     slope_mult <- slope_fun(abs_diff)
+#     slope_mult[abs_diff_is_na] <- 0
+# 
+#     # # soil multiplier depending on choice ("to","from","both")
+#     # if (soil_effect == "to") {
+#     #   s_mult <- soil_vec[to_idx]
+#     # } else if (soil_effect == "from") {
+#     #   s_mult <- soil_vec[from_idx]
+#     # } else { # both: average of source and target multipliers
+#     #   s_mult <- (soil_vec[from_idx] + soil_vec[to_idx]) / 2
+#     # }
+#     # s_mult[is.na(s_mult)] <- 1
+# 
+#     # combine all effects: density * slope * soil
+#     p_kj <- p_density * slope_mult# * s_mult
+# 
+#     # guard to [0,1]
+#     p_kj[is.na(p_kj)] <- 0
+#     p_kj <- pmin(pmax(p_kj, 0), 1)
+# 
+#     # aggregate incoming probabilities per 'to' cell
+#     one_minus_p <- 1 - p_kj
+#     prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+#     to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
+#     p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
+# 
+#     # stochastic draws
+#     draws <- runif(length(to_cells_unique))
+#     newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+# 
+#     if (length(newly_infected_idx) == 0) break
+# 
+#     infected[newly_infected_idx] <- 1L
+# 
+#     # store raster for this step
+#     rstep <- rast(oakdens)
+#     values(rstep) <- infected
+#     names(rstep) <- paste0("t", step)
+#     history[[length(history) + 1]] <- rstep
+# 
+#     step <- step + 1L
+#   }
+# 
+#   final_r <- rast(oakdens)
+#   values(final_r) <- infected
+#   names(final_r) <- "final"
+# 
+#   return(list(history = history, final = final_r))
+# }
+# 
+# 
+# 
+# 
+# sim1 <- run_single_sim(oakdens = oakdens_crop,
+#                        dem = dem_crop,
+#                        dens_vals = dens_vals,
+#                        adj_pairs_dir = adj_pairs_dir,
+#                        start_cell = start_cell,
+#                        max_steps = 100,
+#                        soil_effect = "from",
+#                        soil_mult = soil_crop)
+
+
+
+```
+
+Add soils
+
+```{r}
+
+# Updated simulation: multiplies transmission probability by soil multiplier raster/value
+#
+# Usage:
+# sim1 <- run_single_sim(
+#   oakdens = oakdens,
+#   dem = dem_aligned,
+#   dens_vals = dens_vals,
+#   soil_mult = soil_mult_r,          # SpatRaster OR numeric vector aligned to oakdens
+#   adj_pairs_dir = adj_pairs_dir,
+#   start_cell = start_cell,
+#   max_steps = 100,
+#   beta = 0.1,
+#   soil_effect = "to"                # "to" (default), "from", or "both"
+# )
+#
+
+
+# run_single_sim <- function(oakdens,
+#                            dens_vals,
+#                            dem,                # SpatRaster DEM aligned with oakdens (or will be checked)
+#                            soil_mult = NULL,   # either SpatRaster or numeric vector (multiplier per cell)
+#                            adj_pairs_dir,
+#                            start_cell,
+#                            max_steps = 100,
+#                            beta = 0.1,
+#                            slope_fun = NULL,
+#                            soil_effect = c("to", "from", "both")) {
+#   soil_effect <- match.arg(soil_effect)
+# 
+#   # basic checks
+#   if (!inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
+#   if (!inherits(dem, "SpatRaster")) stop("dem must be a SpatRaster")
+#   if (ncell(oakdens) != ncell(dem)) stop("oakdens and dem must have the same number of cells and alignment")
+#   if (length(dens_vals) != ncell(oakdens)) stop("length(dens_vals) must equal number of cells in oakdens")
+#   if (is.na(start_cell) || start_cell < 1 || start_cell > ncell(oakdens)) stop("start_cell is NA or out of range")
+#   if (is.null(slope_fun)) slope_fun <- function(abs_diff) exp(-beta * abs_diff)
+# 
+#   # prepare soil multiplier as numeric vector aligned to oakdens cells
+#   if (is.null(soil_mult)) {
+#     soil_vec <- rep(1, ncell(oakdens))
+#   } else if (inherits(soil_mult, "SpatRaster")) {
+#     # if it doesn't match geometry, resample to oakdens
+#     if (!compareGeom(soil_mult, oakdens, stopOnError = FALSE)) {
+#       message("Soil raster geometry differs from oakdens; resampling soil raster to oakdens grid (method = 'near')...")
+#       soil_mult <- resample(soil_mult, oakdens, method = "near")
+#     }
+#     soil_vec <- values(soil_mult)
+#   } else if (is.numeric(soil_mult) && length(soil_mult) == ncell(oakdens)) {
+#     soil_vec <- soil_mult
+#   } else {
+#     stop("soil_mult must be NULL, a SpatRaster, or a numeric vector of length ncell(oakdens)")
+#   }
+# 
+#   # replace NA soil multipliers with 1 (no effect) to avoid blocking transmission unless you want otherwise
+#   soil_vec[is.na(soil_vec)] <- 1
+# 
+#   # DEM values vector
+#   dem_vals <- values(dem)
+# 
+#   # initialize infection vector
+#   infected <- rep(0L, length(dens_vals))
+#   infected[start_cell] <- 1L
+#   infected[is.na(dens_vals)] <- NA_integer_
+#   infected[is.na(dem_vals)] <- NA_integer_  # ensure nodata in DEM block transmission
+#   infected[is.na(soil_vec)] <- NA_integer_
+# 
+#   # history store
+#   history <- list()
+#   r0 <- rast(oakdens)
+#   values(r0) <- infected
+#   names(r0) <- "t0"
+#   history[[1]] <- r0
+# 
+#   step <- 1L
+#   while (step <= max_steps) {
+#     current_inf_idx <- which(infected == 1L)
+#     if (length(current_inf_idx) == 0) break
+# 
+#     # candidates: from infected -> to uninfected
+#     valid_to_mask <- (infected == 0L)
+#     rows_mask <- (infected[adj_pairs_dir[,1]] == 1L) & (valid_to_mask[adj_pairs_dir[,2]])
+#     if (!any(rows_mask, na.rm = TRUE)) break
+# 
+#     pairs_sub <- adj_pairs_dir[rows_mask, , drop = FALSE]
+#     from_idx <- pairs_sub[,1]
+#     to_idx   <- pairs_sub[,2]
+# 
+#     # density component
+#     # density component: if either from or to density is 0, set probability to 0
+#     p_density <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+#     p_density[is.na(p_density)] <- 0
+#     p_density[dens_vals[from_idx] == 0 | dens_vals[to_idx] == 0] <- 0
+# 
+# 
+#     # elevation multiplier
+#     abs_diff <- abs(dem_vals[from_idx] - dem_vals[to_idx])
+#     abs_diff_is_na <- is.na(abs_diff)
+#     abs_diff[abs_diff_is_na] <- 0
+#     slope_mult <- slope_fun(abs_diff)
+#     slope_mult[abs_diff_is_na] <- 0
+# 
+#     # soil multiplier depending on choice ("to","from","both")
+#     if (soil_effect == "to") {
+#       s_mult <- soil_vec[to_idx]
+#     } else if (soil_effect == "from") {
+#       s_mult <- soil_vec[from_idx]
+#     } else { # both: average of source and target multipliers
+#       s_mult <- (soil_vec[from_idx] + soil_vec[to_idx]) / 2
+#     }
+#     s_mult[is.na(s_mult)] <- 1
+# 
+#     # combine all effects: density * slope * soil
+#     p_kj <- p_density * slope_mult * s_mult
+# 
+#     # guard to [0,1]
+#     p_kj[is.na(p_kj)] <- 0
+#     p_kj <- pmin(pmax(p_kj, 0), 1)
+# 
+#     # aggregate incoming probabilities per 'to' cell
+#     one_minus_p <- 1 - p_kj
+#     prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+#     to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
+#     p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
+# 
+#     # stochastic draws
+#     draws <- runif(length(to_cells_unique))
+#     newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+# 
+#     if (length(newly_infected_idx) == 0) break
+# 
+#     infected[newly_infected_idx] <- 1L
+# 
+#     # store raster for this step
+#     rstep <- rast(oakdens)
+#     values(rstep) <- infected
+#     names(rstep) <- paste0("t", step)
+#     history[[length(history) + 1]] <- rstep
+# 
+#     step <- step + 1L
+#   }
+# 
+#   final_r <- rast(oakdens)
+#   values(final_r) <- infected
+#   names(final_r) <- "final"
+# 
+#   return(list(history = history, final = final_r))
+# }
+# 
+# 
+# 
+# 
+# sim1 <- run_single_sim(oakdens = oakdens_crop,
+#                        dem = dem_crop,
+#                        dens_vals = dens_vals,
+#                        adj_pairs_dir = adj_pairs_dir,
+#                        start_cell = start_cell,
+#                        max_steps = 100,
+#                        soil_effect = "from",
+#                        soil_mult = soil_crop)
+# 
+# 
+
+```
+
+
+Add a random insect vector function
+```{r}
+
+
+run_single_sim <- function(oakdens,
+                           dens_vals,
+                           dem,                # SpatRaster DEM aligned with oakdens
+                           soil_mult = NULL,   # SpatRaster or numeric vector aligned to oakdens
+                           adj_pairs_dir,
+                           start_cell,
+                           max_steps = 100,
+                           beta = 0.1,
+                           slope_fun = NULL,
+                           soil_effect = c("to", "from", "both"),
+                           # jump params
+                           jump_enabled = TRUE,
+                           jump_radius = 600,
+                           jump_beta = 0.01,
+                           # new density effect param
+                           density_power = 1.0
+) {
+  soil_effect <- match.arg(soil_effect)
+  if (!inherits(oakdens, "SpatRaster")) stop("oakdens must be a SpatRaster")
+  if (!inherits(dem, "SpatRaster")) stop("dem must be a SpatRaster")
+  if (ncell(oakdens) != ncell(dem)) stop("oakdens and dem must have same number of cells/alignment")
+  if (length(dens_vals) != ncell(oakdens)) stop("length(dens_vals) must equal ncell(oakdens)")
+  if (is.na(start_cell) || start_cell < 1 || start_cell > ncell(oakdens)) stop("start_cell invalid")
+  if (is.null(slope_fun)) slope_fun <- function(abs_diff) exp(-beta * abs_diff)
+
+  # prepare soil multiplier vector
+  if (is.null(soil_mult)) {
+    soil_vec <- rep(1, ncell(oakdens))
+  } else if (inherits(soil_mult, "SpatRaster")) {
+    if (!compareGeom(soil_mult, oakdens, stopOnError = FALSE)) {
+      message("Resampling soil raster to oakdens grid (near)...")
+      soil_mult <- resample(soil_mult, oakdens, method = "near")
+    }
+    soil_vec <- values(soil_mult)
+  } else if (is.numeric(soil_mult) && length(soil_mult) == ncell(oakdens)) {
+    soil_vec <- soil_mult
+  } else stop("soil_mult must be NULL, a SpatRaster, or numeric vector matching oakdens cells")
+  soil_vec[is.na(soil_vec)] <- 1
+
+  dem_vals <- values(dem)
+
+  # init infection vector
+  infected <- rep(0L, length(dens_vals))
+  infected[start_cell] <- 1L
+  infected[is.na(dens_vals)] <- NA_integer_
+  infected[is.na(dem_vals)] <- NA_integer_
+  infected[is.na(soil_vec)] <- NA_integer_
+
+  # history
+  history <- list()
+  r0 <- rast(oakdens); values(r0) <- infected; names(r0) <- "t0"; history[[1]] <- r0
+
+  step <- 1L
+  while (step <= max_steps) {
+    current_inf_idx <- which(infected == 1L)
+    if (length(current_inf_idx) == 0) break
+
+    # --------------------
+    # Local neighbourhood spread
+    # --------------------
+    valid_to_mask <- (infected == 0L)
+    rows_mask <- (infected[adj_pairs_dir[,1]] == 1L) & (valid_to_mask[adj_pairs_dir[,2]])
+    if (any(rows_mask, na.rm = TRUE)) {
+      pairs_sub <- adj_pairs_dir[rows_mask, , drop = FALSE]
+      from_idx <- pairs_sub[,1]; to_idx <- pairs_sub[,2]
+
+      # Restrict to targets with oak density > 0 (otherwise skip)
+      keep_mask <- (dens_vals[to_idx] > 0)
+      if (any(keep_mask, na.rm = TRUE)) {
+        from_idx <- from_idx[keep_mask]
+        to_idx   <- to_idx[keep_mask]
+
+        # density component (average) and ensure zero where density is zero
+        p_density <- (dens_vals[from_idx] + dens_vals[to_idx]) / 2
+        p_density[is.na(p_density)] <- 0
+
+        # apply additional density dependence using target density
+        # dens_power of 0 => no extra effect; 1 => multiply by target density; >1 favour high-density more
+        if (!is.null(density_power) && density_power != 0) {
+          tp <- dens_vals[to_idx]
+          tp[is.na(tp)] <- 0
+          p_density <- p_density * (tp ^ density_power)
+        }
+
+        # elevation multiplier
+        abs_diff <- abs(dem_vals[from_idx] - dem_vals[to_idx])
+        abs_diff_is_na <- is.na(abs_diff)
+        abs_diff[abs_diff_is_na] <- 0
+        slope_mult <- slope_fun(abs_diff)
+        slope_mult[abs_diff_is_na] <- 0
+
+        # soil multiplier acc. to choice
+        if (soil_effect == "to") {
+          s_mult <- soil_vec[to_idx]
+        } else if (soil_effect == "from") {
+          s_mult <- soil_vec[from_idx]
+        } else {
+          s_mult <- (soil_vec[from_idx] + soil_vec[to_idx]) / 2
+        }
+        s_mult[is.na(s_mult)] <- 1
+
+        # combine
+        p_kj <- p_density * slope_mult * s_mult
+        p_kj[is.na(p_kj)] <- 0
+        p_kj <- pmin(pmax(p_kj, 0), 1)
+
+        # aggregate incoming probabilities
+        one_minus_p <- 1 - p_kj
+        prod_1_minus_p_by_to <- tapply(one_minus_p, INDEX = to_idx, FUN = prod)
+        to_cells_unique <- as.integer(names(prod_1_minus_p_by_to))
+        p_total_by_to <- 1 - as.numeric(prod_1_minus_p_by_to)
+
+        # stochastic draws
+        draws <- runif(length(to_cells_unique))
+        newly_infected_idx <- to_cells_unique[draws < p_total_by_to]
+        if (length(newly_infected_idx) > 0) infected[newly_infected_idx] <- 1L
+      }
+    }
+
+    # --------------------
+    # Jump infection (one per timestep)
+    # restrict jump candidates to cells with dens_vals > 0 and weight by density
+    # --------------------
+    if (jump_enabled && length(which(infected == 1L)) > 0) {
+      src_r <- rast(oakdens)
+      vals_src <- rep(NA_real_, ncell(oakdens))
+      vals_src[infected == 1L] <- 1
+      values(src_r) <- vals_src
+
+      dist_r <- distance(src_r)
+      dist_vals <- values(dist_r)
+
+      # candidate uninfected cells within radius and with oak density > 0
+      cand_idx <- which(infected == 0L & !is.na(dist_vals) & dist_vals <= jump_radius & dens_vals > 0)
+      if (length(cand_idx) > 0) {
+        d_cand <- dist_vals[cand_idx]
+        # distance weight
+        w_dist <- exp(-jump_beta * d_cand)
+        # density weight (target)
+        if (!is.null(density_power) && density_power != 0) {
+          w_dens <- (dens_vals[cand_idx] ^ density_power)
+        } else {
+          w_dens <- rep(1, length(cand_idx))
+        }
+        w <- w_dist * w_dens
+        w[is.na(w) | w < 0] <- 0
+        if (sum(w) > 0) {
+          sel <- sample(cand_idx, size = 1, prob = w)
+          infected[sel] <- 1L
+        }
+      }
+    }
+
+    # save step
+    rstep <- rast(oakdens); values(rstep) <- infected; names(rstep) <- paste0("t", step)
+    history[[length(history) + 1]] <- rstep
+
+    step <- step + 1L
+  }
+
+  final_r <- rast(oakdens); values(final_r) <- infected; names(final_r) <- "final"
+  return(list(history = history, final = final_r))
+}
+
+sim1 <- run_single_sim(
+  oakdens = oakdens,
+  dem = dem,
+  dens_vals = dens_vals,
+  soil_mult = soil_raster,       # SpatRaster or vector
+  adj_pairs_dir = adj_pairs_dir,
+  start_cell = start_cell,
+  max_steps = 100,
+  beta = log(2) / 50,           # elevation effect
+  jump_enabled = TRUE,
+  jump_radius = 600,             # metres (map units)
+  jump_beta = 0.025,       # half-weight at 200 m (example)
+      
+)
+
+```
+
+
+Plot the infection simulation
+
+```{r}
+
+
+
+# Convert to sf
+camps_sf <- st_as_sf(
+  camps,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326   # WGS84
+)
+
+# Reproject to oakdens CRS so tmap layers align
+oak_crs <- crs(oakdens)            # terra::crs returns proj4/WKT string acceptable to sf
+if (is.na(oak_crs) || oak_crs == "") {
+  warning("oakdens has no CRS. Points kept in their original CRS.")
+} else {
+  camps_sf <- st_transform(camps_sf, crs = oak_crs)
+}
+
+# Now build the map (uses your style; adjust palette etc. as desired)
+# ensure pal_colors exists
+if (!exists("pal_colors")) pal_colors <- rev(terrain.colors(7))
+
+# Prepare infection layer (from sim1$final)
+inf_r <- sim1$final
+vals <- values(inf_r)
+vals[!is.na(vals) & vals == 0] <- NA
+values(inf_r) <- vals
+
+oak_map <- tm_basemap("CartoDB.PositronNoLabels") +
+
+  tm_shape(oakdens) +
+  tm_raster(
+    palette = pal_colors,
+    title = "Predicted Oak Density"
+  ) +
+
+  tm_shape(inf_r) +
+  tm_raster(
+    palette = "Reds",
+    title = "Infected (final)",
+    alpha = 0.6,
+    style = "cat"
+  ) +
+
+  tm_shape(camps_sf) +
+  tm_symbols(
+    shape = 21,
+    col = "purple",
+    size = 0.5,
+    fill.alpha = 0.8
+  ) +
+
+  tm_add_legend(
+    type = "symbol",
+    labels = "Campsites",
+    col = "purple",
+    shape = 21,
+    size = 0.5
+  ) +
+
+  tm_layout(
+    legend.outside = FALSE,
+    legend.position = c("right", "bottom"),
+    legend.just = c("right", "bottom"),
+    fontfamily = "serif"
+  )
+
+tmap_mode("plot")
+oak_map
+
+```
+
+```{r}
+
+
+
+# prepare infection raster (sim1$final from run_single_sim)
+inf_r <- sim1$final
+
+# set uninfected (0) -> NA so they are transparent on the overlay
+inf_vals <- values(inf_r)
+inf_vals[!is.na(inf_vals) & inf_vals == 0] <- NA
+values(inf_r) <- inf_vals
+
+
+
+
+## ---- Project rasters to Leaflet CRS (EPSG:3857) ----
+oakdens_3857 <- project(oakdens, "EPSG:3857")
+inf_3857     <- project(inf_r, "EPSG:3857")
+
+## ---- Prepare infection raster: 1 = infected, NA = transparent ----
+inf_vals <- values(inf_3857)
+inf_vals[inf_vals == 0] <- NA
+values(inf_3857) <- inf_vals
+
+## ---- Convert to RasterLayer for leaflet ----
+oakdens_r <- raster(oakdens_3857)
+inf_r     <- raster(inf_3857)
+
+## ---- Color palettes ----
+pal_oak <- colorNumeric(
+  palette = pal,
+  domain  = range(0:1),
+  na.color = "transparent"
+)
+
+pal_inf <- colorFactor(
+  palette = "red",
+  levels = 1,
+  na.color = "transparent"
+)
+
+## ---- Count infected cells for legend ----
+infected_count <- sum(values(inf_r) == 1, na.rm = TRUE)
+
+## ---- Build Leaflet map ----
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+
+  addRasterImage(
+    oakdens_r,
+    colors = pal_oak,
+    opacity = 0.8,
+    group = "Predicted Oak Density"
+  ) %>%
+
+  addLegend(
+    pal = pal_oak,
+    values = range(values(oakdens_r), na.rm = TRUE),
+    title = "Predicted Oak Density",
+    position = "topright"
+  ) %>%
+
+  addRasterImage(
+    inf_r,
+    colors = pal_inf,
+    opacity = 0.6,
+    group = "Oak Wilt"
+  ) %>%
+
+  addLegend(
+    colors = "red",
+    labels = paste0("Infected (", infected_count, ")"),
+    title = "Oak Wilt",
+    position = "bottomleft"
+  ) %>%
+
+ addCircleMarkers( data = camps,
+    lng = ~Longitude,
+    lat = ~Latitude,
+    radius = 2,
+    color = "black",
+    fillColor = "yellow",
+    fillOpacity = 0.8, popup = ~if ("Name" %in% names(camps)) paste("Campsite:", Name) else "Campsite" )%>%
+
+  addLayersControl(
+    overlayGroups = c(
+      "Oak Wilt (t0)",
+      "Predicted Oak Density",
+      "Campsites"
+    ),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+   
+
+hist_stack <- rast(sim1$history)
+
+
+```
+
+
+Plot the time series
+
+```{r}
+
+# compute infected counts from sim1$history (list of SpatRasters t0, t1, ...)
+counts <- sapply(sim1$history, function(r) {
+  v <- values(r)
+  sum(v == 1, na.rm = TRUE)   # ignore NA cells
+})
+
+years <- 0:(length(counts) - 1)   # year 0 = initial state, year 1 = after 1 timestep, etc.
+
+library(ggplot2)
+
+df <- data.frame(
+  year = years,
+  cumulative = counts,
+  new = c(NA, diff(counts))
+)
+
+# cumulative plot
+ggplot(df, aes(x = year, y = cumulative)) +
+  geom_line(color = "darkred", size = 1) +
+  geom_point(color = "darkred") +
+  labs(title = "Oak wilt: cumulative infected cells", x = "Year", y = "Infected cells") +
+  theme_minimal()
+
+# new infections (incidence) bar plot
+ggplot(df[-1, ], aes(x = year, y = new)) +   # drop year 0 (NA)
+  geom_col(fill = "steelblue") +
+  labs(title = "New infected cells per year", x = "Year", y = "New infections") +
+  theme_minimal()
+
+```
+
+spread animation gif
+
+```{r}
+
+
+
+#animate(hist_stack, pause = 0.5, n =2)
+
+
+
+
+oak_bg <- oakdens
+oak_bg[] <- oakdens[]
+
+hist_stack2 <- hist_stack
+hist_stack2[hist_stack2 == 0] <- NA
+
+composite <- rast(hist_stack2)
+
+for (i in 1:nlyr(hist_stack2)) {
+  r <- hist_stack2[[i]]
+
+  # combine: background + infection
+  composite[[i]] <- cover(r * 2, oakdens)
+}
+
+
+# animate(composite, pause = 0.5, col = c(terrain.colors(100), "red"),   legend = FALSE)
+
+suppressWarnings(
+  save_gif(
+    animate(composite, pause = 0.5, col = c(terrain.colors(100), "red"), legend = FALSE),
+    gif_file = "animations/Oak_Spread.gif"
+  )
+)
+
+```
+
+
+
+
+```{r}
+
+```
+
+
+
+
+
